@@ -106,17 +106,39 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(self.request(b"GET /sentinel/api/v1/status HTTP/1.0\r\n\r\n"), b"")
         self.assertEqual(calls, [])
 
-    def test_capacity_and_absolute_deadline(self):
-        self.start(max_connections=1, request_timeout=0.25)
+    def test_capacity_is_released_after_disconnect(self):
+        self.start(max_connections=1, request_timeout=2)
+        entered = threading.Event()
+        original = self.server._request
+        def observed(conn, deadline):
+            entered.set()
+            return original(conn, deadline)
+        self.server._request = observed
         with self.connect() as held:
             held.sendall(b"G")
-            time.sleep(0.06)
+            self.assertTrue(entered.wait(1))
             self.assertEqual(self.request(b"GET /sentinel/api/v1/status HTTP/1.0\r\n\r\n"), b"")
-            time.sleep(0.12)
-            held.sendall(b"E")
-            time.sleep(0.13)
-            self.assertEqual(held.recv(1), b"")
-        self.assertIn(b"200 OK", self.request(b"GET /sentinel/api/v1/status HTTP/1.0\r\n\r\n"))
+        end = time.monotonic() + 2
+        while time.monotonic() < end:
+            result = self.request(b"GET /sentinel/api/v1/status HTTP/1.0\r\n\r\n")
+            if b"200 OK" in result: break
+            time.sleep(0.005)
+        self.assertIn(b"200 OK", result)
+
+    def test_absolute_deadline_is_not_extended_by_incoming_bytes(self):
+        self.server = SentinelServer(self.path, {ROUTE: lambda: {"ok": True}})
+        now, timeouts = [0.0], []
+        class DrippingConnection:
+            def settimeout(self, value): timeouts.append(value)
+            def recv(self, size):
+                now[0] += 0.1
+                return b"G"
+        with mock.patch("orbis_sentinel.server.time.monotonic", side_effect=lambda: now[0]):
+            with self.assertRaises(TimeoutError):
+                self.server._request(DrippingConnection(), 0.25)
+        self.assertEqual(len(timeouts), 3)
+        self.assertAlmostEqual(timeouts[0], 0.25)
+        self.assertAlmostEqual(timeouts[-1], 0.05)
 
     def test_inherited_listener_and_replacement_preserved(self):
         listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
