@@ -20,14 +20,23 @@ class CaptureCliTests(unittest.TestCase):
         with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors), \
                 patch.object(cli.sys, 'stdin', input_stream), patch.object(cli.sys, 'platform', 'linux'), \
                 patch.object(cli.os, 'geteuid', return_value=0 if root else 501), \
-                patch.object(cli, 'CaptureCatalog') as factory:
+                patch.object(cli, 'CaptureCatalog') as factory, patch.object(cli, 'check_publication_image') as preflight:
             catalog = factory.return_value.__enter__.return_value
             catalog.reserve.return_value = {'id': 'test', 'dataState': 'reserved'}
             catalog.retain_draft.return_value = {'id': 'test', 'dataState': 'retained-unverified'}
             catalog.publish_prepared.return_value = {'id': 'test', 'dataState': 'verified', 'lifecycleState': 'unobserved'}
             catalog.reserve.side_effect = failure
             catalog.publish_prepared.side_effect = failure
-            args = (['--reserve', '--key-fd', '3'] if operation == 'reserve' else ['--publish', '--checkpoint-fd', '5']
+            preflight.return_value = {'schema': 'test-preflight', 'imageId': request.get('recoveryImageId')}
+            if operation in {'check-publication-image', 'reserve-for-publication'}:
+                preflight.side_effect = failure
+            if operation == 'reserve-for-publication':
+                def checked_reserve(**kwargs):
+                    self.assertTrue(preflight.called, 'Custody preceded image preflight')
+                    return {'id': 'test', 'dataState': 'reserved'}
+                catalog.reserve.side_effect = checked_reserve
+            args = (['--' + operation, '--key-fd', '3'] if operation in {'reserve', 'reserve-for-publication'} else
+                    ['--check-publication-image'] if operation == 'check-publication-image' else ['--publish', '--checkpoint-fd', '5']
                     if operation == 'publish' else ['--retain-draft', '--point-fd', '4'])
             status = cli.main(args)
         return status, output.getvalue(), errors.getvalue(), factory, catalog
@@ -60,6 +69,42 @@ class CaptureCliTests(unittest.TestCase):
         catalog.retain_draft.assert_called_once_with('test', point_fd=4, preparation_sha256='a' * 64,
                                                     source_hold_sha256='b' * 64)
         self.assertEqual(json.loads(output)['result']['dataState'], 'retained-unverified')
+
+    def test_publication_reservation_checks_the_image_before_key_custody(self):
+        request = {**self.reservation(), 'schema': 'orbis-sentinel.capture-reserve-for-publication.v1'}
+        status, output, errors, _, catalog = self.invoke('reserve-for-publication', request)
+        self.assertEqual(status, 0, errors)
+        self.assertEqual(json.loads(output)['result'], {'custody': {'id': 'test', 'dataState': 'reserved'},
+                                                        'imagePreflight': {'schema': 'test-preflight', 'imageId': request['recoveryImageId']}})
+        catalog.reserve.assert_called_once()
+
+    def test_failed_or_uncertain_preflight_never_receives_the_key(self):
+        request = {**self.reservation(), 'schema': 'orbis-sentinel.capture-reserve-for-publication.v1'}
+        for error, code in ((ValueError('private failure'), 1), (v.CleanupIndeterminate('private failure'), 2)):
+            with self.subTest(code=code):
+                status, output, errors, _, catalog = self.invoke('reserve-for-publication', request, failure=error)
+                self.assertEqual(status, code)
+                self.assertFalse(output)
+                self.assertNotIn('private failure', errors)
+                catalog.reserve.assert_not_called()
+
+    def test_check_does_not_accept_key_or_reservation_fields(self):
+        request = {'schema': 'orbis-sentinel.capture-check-publication-image.v1', 'catalogDirectory': '/catalog',
+                   'recoveryImageId': self.reservation()['recoveryImageId']}
+        status, output, errors, _, catalog = self.invoke('check-publication-image', request)
+        self.assertEqual(status, 0, errors)
+        self.assertEqual(json.loads(output)['operation'], 'check-publication-image')
+        catalog.reserve.assert_not_called()
+        status, _, _, factory, _ = self.invoke('check-publication-image', {**request, 'key': 'forbidden'})
+        self.assertEqual(status, 1)
+        factory.assert_not_called()
+
+    def test_new_capability_is_separate_from_legacy_custody(self):
+        for option, expected in (('--capability', cli.CAPABILITY), ('--publication-capability', cli.PUBLICATION_CAPABILITY),
+                                 ('--image-check-capability', cli.IMAGE_CHECK_CAPABILITY)):
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(cli.main([option]), 0)
+            self.assertEqual(json.loads(output.getvalue()), expected)
 
     def test_publication_passes_checkpoint_and_original_authority_bindings(self):
         request = {'schema': 'orbis-sentinel.capture-publish.v1', 'catalogDirectory': '/catalog',

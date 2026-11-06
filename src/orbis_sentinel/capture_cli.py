@@ -6,6 +6,7 @@ import sys
 
 from . import verification as v
 from .capture_catalog import CaptureCatalog, CatalogError
+from .image_preflight import check_publication_image
 
 
 CAPABILITY = {
@@ -19,6 +20,11 @@ PUBLICATION_CAPABILITY = {
     'publicationSchema': 'orbis.core-capture-catalog-publication.v1',
     'lifecycleAuthority': False, 'incompleteReplay': 'forbidden',
 }
+IMAGE_CHECK_CAPABILITY = {
+    'schema': 'orbis-sentinel.capture-image-check-capability.v1', 'version': 1,
+    'operations': ['check-publication-image', 'reserve-for-publication'],
+    'lifecycleAuthority': False,
+}
 
 
 def _request(operation):
@@ -27,16 +33,19 @@ def _request(operation):
         raise ValueError('Invalid capture custody request')
     value = v._json(body)
     common = {'schema', 'catalogDirectory'}
+    reserve = operation in {'reserve', 'reserve-for-publication'}
     fields = (common | {'dataDirectory', 'sourceDirectories', 'jobId', 'installationId', 'sourceSha256',
-                        'recoveryImageId', 'reservation'} if operation == 'reserve'
+                        'recoveryImageId', 'reservation'} if reserve
               else common | {'pointId', 'preparationSha256', 'sourceHoldSha256'})
+    if operation == 'check-publication-image':
+        fields = common | {'recoveryImageId'}
     if operation == 'publish':
         fields |= {'expectation', 'terminalSha256'}
     if (not v._exact(value, fields)
             or value['schema'] != 'orbis-sentinel.capture-' + operation + '.v1'
             or v._canonical(value).encode() != body):
         raise ValueError('Invalid capture custody request')
-    if operation == 'reserve' and (type(value['sourceDirectories']) is not list
+    if reserve and (type(value['sourceDirectories']) is not list
                                    or not 1 <= len(value['sourceDirectories']) <= 64
                                    or any(not isinstance(directory, str) for directory in value['sourceDirectories'])):
         raise ValueError('Invalid capture source directories')
@@ -51,26 +60,38 @@ def main(argv=None):
     group.add_argument('--retain-draft', action='store_true')
     group.add_argument('--publication-capability', action='store_true')
     group.add_argument('--publish', action='store_true')
+    group.add_argument('--image-check-capability', action='store_true')
+    group.add_argument('--check-publication-image', action='store_true')
+    group.add_argument('--reserve-for-publication', action='store_true')
     parser.add_argument('--key-fd', type=int)
     parser.add_argument('--point-fd', type=int)
     parser.add_argument('--checkpoint-fd', type=int)
     args = parser.parse_args(argv)
-    if args.capability or args.publication_capability:
+    if args.capability or args.publication_capability or args.image_check_capability:
         if any(fd is not None for fd in (args.key_fd, args.point_fd, args.checkpoint_fd)):
             parser.error('Capability does not accept descriptors')
-        print(v._canonical(PUBLICATION_CAPABILITY if args.publication_capability else CAPABILITY))
+        print(v._canonical(IMAGE_CHECK_CAPABILITY if args.image_check_capability else
+                           PUBLICATION_CAPABILITY if args.publication_capability else CAPABILITY))
         return 0
     if sys.platform != 'linux' or os.geteuid() != 0:
         print('Capture custody requires the Linux recovery supervisor.', file=sys.stderr)
         return 1
-    operation = 'reserve' if args.reserve else 'publish' if args.publish else 'retain-draft'
-    descriptor = args.key_fd if args.reserve else args.checkpoint_fd if args.publish else args.point_fd
-    if descriptor is None or descriptor < 3 or sum(fd is not None for fd in (args.key_fd, args.point_fd, args.checkpoint_fd)) != 1:
+    reserve = args.reserve or args.reserve_for_publication
+    operation = ('check-publication-image' if args.check_publication_image else 'reserve-for-publication'
+                 if args.reserve_for_publication else 'reserve' if args.reserve else 'publish' if args.publish else 'retain-draft')
+    descriptor = args.key_fd if reserve else args.checkpoint_fd if args.publish else args.point_fd
+    count = sum(fd is not None for fd in (args.key_fd, args.point_fd, args.checkpoint_fd))
+    if (args.check_publication_image and count != 0 or not args.check_publication_image
+            and (descriptor is None or descriptor < 3 or count != 1)):
         parser.error('Choose the descriptor for this operation')
     try:
         request = _request(operation)
         with CaptureCatalog(request['catalogDirectory']) as catalog:
-            if args.reserve:
+            if args.check_publication_image:
+                result = check_publication_image(catalog, request['recoveryImageId'])
+            elif reserve:
+                # Keep the catalog lock from feature check through key custody.
+                preflight = check_publication_image(catalog, request['recoveryImageId']) if args.reserve_for_publication else None
                 result = catalog.reserve(
                     job_id=request['jobId'], installation_id=request['installationId'],
                     source_sha256=request['sourceSha256'], recovery_image_id=request['recoveryImageId'],
@@ -78,6 +99,8 @@ def main(argv=None):
                     data_directory=request['dataDirectory'],
                     additional_data_directories=request['sourceDirectories'],
                 )
+                if args.reserve_for_publication:
+                    result = {'custody': result, 'imagePreflight': preflight}
             elif args.retain_draft:
                 result = catalog.retain_draft(
                     request['pointId'], point_fd=descriptor,

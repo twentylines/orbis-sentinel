@@ -71,3 +71,9 @@ The separate `--publication-capability` and root-only `--publish` operation asse
 A persistent claim precedes external work. Incomplete or uncertain attempts require reconciliation; repeating the command does not repeat them. A successfully committed reply can be recovered by observing the same bound object. The exclusively owned sealed workspace is verified in place and adopted by directory rename, avoiding another full capture copy. Original retained drafts, keys and failure evidence remain private.
 
 This publishes verified data while Orbis is unavailable. It does not complete the capture lifecycle, release holds, start services or restore data. Automatic workflow enrollment, lifecycle settlement, the recovery UI and real application restoration still need integration and verification.
+
+### Publication image preflight
+
+The separate `--image-check-capability` identifies an optional image-check protocol. An enrolled host can use `--check-publication-image` before creating a capture preparation. A restricted container checks the exact publication, sealing, catalog and image-inventory worker capabilities in the approved local image. It receives no host mounts, keys or network access. The image ID must already be independently approved; a capability response does not establish trust.
+
+The new `--reserve-for-publication` operation repeats that check under the catalog lock before reading and retaining the supplied key descriptor. It returns both custody and image-check evidence, allowing a compatible supervisor to bind one publisher before draining the source. Missing workers, malformed replies and uncertain cleanup stop the new path. The original custody capability and `--reserve` operation remain unchanged for older callers and images. Neither image checks nor publisher selection release maintenance holds or authorize replay.
