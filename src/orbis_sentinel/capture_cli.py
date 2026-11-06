@@ -7,6 +7,7 @@ import sys
 from . import verification as v
 from .capture_catalog import CaptureCatalog, CatalogError
 from .image_preflight import check_publication_image
+from .capture_export import open_published_file
 
 
 CAPABILITY = {
@@ -25,6 +26,12 @@ IMAGE_CHECK_CAPABILITY = {
     'operations': ['check-publication-image', 'reserve-for-publication'],
     'lifecycleAuthority': False,
 }
+EXPORT_CAPABILITY = {
+    'schema': 'orbis-sentinel.capture-export-capability.v1', 'version': 1,
+    'operations': ['export-file'], 'pointVersion': 3,
+    'files': ['capture-draft.orbis', 'core.orbis', 'icons.orbis', 'metadata.orbis', 'point.json', 'wallpaper.orbis'],
+    'verification': 'delivered-sha256-and-file-seals.v1', 'lifecycleAuthority': False,
+}
 
 
 def _request(operation):
@@ -41,6 +48,8 @@ def _request(operation):
         fields = common | {'recoveryImageId'}
     if operation == 'publish':
         fields |= {'expectation', 'terminalSha256'}
+    if operation == 'export-file':
+        fields |= {'fileName', 'publicationSha256', 'terminalSha256'}
     if (not v._exact(value, fields)
             or value['schema'] != 'orbis-sentinel.capture-' + operation + '.v1'
             or v._canonical(value).encode() != body):
@@ -63,31 +72,46 @@ def main(argv=None):
     group.add_argument('--image-check-capability', action='store_true')
     group.add_argument('--check-publication-image', action='store_true')
     group.add_argument('--reserve-for-publication', action='store_true')
+    group.add_argument('--export-capability', action='store_true')
+    group.add_argument('--export-file', action='store_true')
     parser.add_argument('--key-fd', type=int)
     parser.add_argument('--point-fd', type=int)
     parser.add_argument('--checkpoint-fd', type=int)
     args = parser.parse_args(argv)
-    if args.capability or args.publication_capability or args.image_check_capability:
+    if args.capability or args.publication_capability or args.image_check_capability or args.export_capability:
         if any(fd is not None for fd in (args.key_fd, args.point_fd, args.checkpoint_fd)):
             parser.error('Capability does not accept descriptors')
-        print(v._canonical(IMAGE_CHECK_CAPABILITY if args.image_check_capability else
+        print(v._canonical(EXPORT_CAPABILITY if args.export_capability else IMAGE_CHECK_CAPABILITY if args.image_check_capability else
                            PUBLICATION_CAPABILITY if args.publication_capability else CAPABILITY))
         return 0
     if sys.platform != 'linux' or os.geteuid() != 0:
         print('Capture custody requires the Linux recovery supervisor.', file=sys.stderr)
         return 1
     reserve = args.reserve or args.reserve_for_publication
-    operation = ('check-publication-image' if args.check_publication_image else 'reserve-for-publication'
+    operation = ('export-file' if args.export_file else 'check-publication-image' if args.check_publication_image else 'reserve-for-publication'
                  if args.reserve_for_publication else 'reserve' if args.reserve else 'publish' if args.publish else 'retain-draft')
     descriptor = args.key_fd if reserve else args.checkpoint_fd if args.publish else args.point_fd
     count = sum(fd is not None for fd in (args.key_fd, args.point_fd, args.checkpoint_fd))
-    if (args.check_publication_image and count != 0 or not args.check_publication_image
+    no_descriptor = args.check_publication_image or args.export_file
+    if (no_descriptor and count != 0 or not no_descriptor
             and (descriptor is None or descriptor < 3 or count != 1)):
         parser.error('Choose the descriptor for this operation')
     try:
         request = _request(operation)
         with CaptureCatalog(request['catalogDirectory']) as catalog:
-            if args.check_publication_image:
+            if args.export_file:
+                with open_published_file(catalog, request['pointId'], file_name=request['fileName'],
+                        publication_sha256=request['publicationSha256'], preparation_sha256=request['preparationSha256'],
+                        source_hold_sha256=request['sourceHoldSha256'], terminal_sha256=request['terminalSha256']) as reader:
+                    while block := reader.read(65536):
+                        remaining = memoryview(block)
+                        while remaining:
+                            written = sys.stdout.buffer.write(remaining)
+                            if not written:
+                                raise OSError('Capture stream ended')
+                            remaining = remaining[written:]
+                    reader.complete()
+            elif args.check_publication_image:
                 result = check_publication_image(catalog, request['recoveryImageId'])
             elif reserve:
                 # Keep the catalog lock from feature check through key custody.
@@ -113,8 +137,11 @@ def main(argv=None):
                     preparation_sha256=request['preparationSha256'], source_hold_sha256=request['sourceHoldSha256'],
                     terminal_sha256=request['terminalSha256'],
                 )
-        print(v._canonical({'schema': 'orbis-sentinel.capture-custody-result.v1',
-                            'operation': operation, 'result': result}))
+        if args.export_file:
+            sys.stdout.buffer.flush()
+        else:
+            print(v._canonical({'schema': 'orbis-sentinel.capture-custody-result.v1',
+                                'operation': operation, 'result': result}))
         return 0
     except v.CleanupIndeterminate:
         print('Capture publication stopped. Worker cleanup needs review; recovery information was kept.', file=sys.stderr)

@@ -101,10 +101,35 @@ class CaptureCliTests(unittest.TestCase):
 
     def test_new_capability_is_separate_from_legacy_custody(self):
         for option, expected in (('--capability', cli.CAPABILITY), ('--publication-capability', cli.PUBLICATION_CAPABILITY),
-                                 ('--image-check-capability', cli.IMAGE_CHECK_CAPABILITY)):
+                                 ('--image-check-capability', cli.IMAGE_CHECK_CAPABILITY), ('--export-capability', cli.EXPORT_CAPABILITY)):
             with contextlib.redirect_stdout(io.StringIO()) as output:
                 self.assertEqual(cli.main([option]), 0)
             self.assertEqual(json.loads(output.getvalue()), expected)
+
+    def test_export_stdout_is_exact_binary_and_late_failure_is_not_success(self):
+        request = {'schema': 'orbis-sentinel.capture-export-file.v1', 'catalogDirectory': '/catalog',
+                   'pointId': 'test', 'fileName': 'core.orbis', 'publicationSha256': 'a' * 64,
+                   'preparationSha256': 'b' * 64, 'sourceHoldSha256': 'c' * 64, 'terminalSha256': 'd' * 64}
+        for late_failure in (False, True):
+            raw = io.BytesIO()
+            output = io.TextIOWrapper(raw, encoding='utf8')
+            errors = io.StringIO()
+            with contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors), \
+                    patch.object(cli.sys, 'stdin', io.TextIOWrapper(io.BytesIO(v._canonical(request).encode()))), \
+                    patch.object(cli.sys, 'platform', 'linux'), patch.object(cli.os, 'geteuid', return_value=0), \
+                    patch.object(cli, 'CaptureCatalog') as catalog, patch.object(cli, 'open_published_file') as opened:
+                reader = opened.return_value.__enter__.return_value
+                reader.read.side_effect = [b'\x00\xffciphertext', b'']
+                if late_failure:
+                    opened.return_value.__exit__.side_effect = ValueError('/private/secret')
+                status = cli.main(['--export-file'])
+                output.flush()
+                self.assertEqual(raw.getvalue(), b'\x00\xffciphertext')
+                self.assertEqual(status, 1 if late_failure else 0)
+                self.assertNotIn('/private/secret', errors.getvalue())
+                reader.complete.assert_called_once()
+                catalog.return_value.__enter__.return_value.reserve.assert_not_called()
+            output.detach()
 
     def test_publication_passes_checkpoint_and_original_authority_bindings(self):
         request = {'schema': 'orbis-sentinel.capture-publish.v1', 'catalogDirectory': '/catalog',
