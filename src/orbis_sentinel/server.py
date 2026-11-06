@@ -17,7 +17,7 @@ import time
 
 from .contracts import API_PREFIX
 
-_ROUTES = frozenset(API_PREFIX + "/" + name for name in ("health", "status", "telemetry"))
+_ROUTES = frozenset(API_PREFIX + "/" + name for name in ("health", "status", "telemetry", "progress"))
 _TOKEN = re.compile(rb"[!#$%&'*+.^_`|~0-9A-Za-z-]+\Z")
 _MAX_HEADERS = 16384
 _MAX_LINE = 8192

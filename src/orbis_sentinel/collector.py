@@ -40,6 +40,8 @@ class TelemetryCollector:
     automatic restarts. No privileged job or lifecycle command runs here.
     """
 
+    schema = "orbis-sentinel.telemetry.v1"
+
     def __init__(self, paths=("/",), interval=1.0, *, max_age=5.0,
                  context=None, worker=_sample_worker, monotonic=time.monotonic):
         checked = TelemetrySampler(paths, interval)
@@ -97,7 +99,7 @@ class TelemetryCollector:
                 observed, sample = value["observed"], value["sample"]
                 if (type(observed) not in (int, float) or not math.isfinite(observed)
                         or not 0 <= observed <= now or (self.observed is not None and observed <= self.observed)
-                        or type(sample) is not dict or sample.get("schema") != "orbis-sentinel.telemetry.v1"):
+                        or type(sample) is not dict or sample.get("schema") != self.schema):
                     continue
                 # Reject non-finite JSON accepted by Python's decoder as extensions.
                 json.dumps(sample, allow_nan=False)

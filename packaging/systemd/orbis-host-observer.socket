@@ -1,0 +1,16 @@
+[Unit]
+Description=Orbis read-only update progress
+
+[Socket]
+ListenStream=/run/orbis-observer/progress.sock
+SocketUser=root
+SocketGroup=orbis-observer
+SocketMode=0660
+DirectoryMode=0755
+Backlog=16
+FileDescriptorName=orbis-observer-v1
+Service=orbis-host.service
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

@@ -12,6 +12,7 @@ from .collector import TelemetryCollector
 from .contracts import API_PREFIX, PROTOCOL_VERSION
 from .server import SentinelServer
 from .status import ComponentStatus, build_status
+from .observer import ObserverCollector
 
 
 def activation_listener():
@@ -41,12 +42,15 @@ def main(argv=None):
     source.add_argument("--socket", help="new socket in an existing private runtime directory")
     source.add_argument("--systemd-socket", action="store_true", help="use the systemd API socket")
     parser.add_argument("--disk-path", action="append", dest="paths", help="filesystem to monitor (repeatable)")
+    parser.add_argument("--observer-socket", help="enrolled read-only host progress socket")
     args = parser.parse_args(argv)
     stop = threading.Event()
     original = {}
-    collector = listener = server = thread = None
+    collector = observer = listener = server = thread = None
     try:
         collector = TelemetryCollector(tuple(args.paths) if args.paths else ("/",))
+        if args.observer_socket:
+            observer = ObserverCollector(args.observer_socket)
         if args.systemd_socket:
             listener = activation_listener()
         providers = {
@@ -55,17 +59,24 @@ def main(argv=None):
             API_PREFIX + "/status": lambda: build_status(ComponentStatus(None, None, "unknown"),
                                                           ComponentStatus(__version__, None, "healthy")),
             API_PREFIX + "/telemetry": collector.snapshot,
+            API_PREFIX + "/progress": observer.snapshot if observer else lambda: {
+                "schema": "orbis-sentinel.progress.v1", "available": False,
+                "progress": None, "ageMs": None, "sourceState": "unavailable"},
         }
         server = SentinelServer(listener.getsockname() if listener else args.socket, providers, listener=listener)
         for signum in (signal.SIGTERM, signal.SIGINT):
             original[signum] = signal.signal(signum, lambda *_: stop.set())
         collector.start()
+        if observer is not None:
+            observer.start()
         thread = threading.Thread(target=server.serve_forever, name="orbis-sentinel-api", daemon=True)
         thread.start()
         while not stop.wait(0.25):
             if not thread.is_alive():
                 raise RuntimeError("Sentinel API stopped")
             collector.maintain()
+            if observer is not None:
+                observer.maintain()
         return 0
     except (OSError, ValueError, RuntimeError):
         print("Orbis Sentinel could not start or continue its local service.", file=sys.stderr)
@@ -81,5 +92,7 @@ def main(argv=None):
             listener.close()
         if collector is not None:
             collector.close()
+        if observer is not None:
+            observer.close()
         for signum, handler in original.items():
             signal.signal(signum, handler)
