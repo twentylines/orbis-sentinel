@@ -2,6 +2,7 @@ import contextlib
 import io
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 import tempfile
@@ -21,12 +22,19 @@ class VerificationCliTests(unittest.TestCase):
             python = root / 'python3'
             python.write_text('#!/bin/sh\ntouch ' + str(marker) + '\nexit 90\n')
             python.chmod(0o700)
-            launcher = Path(__file__).resolve().parents[1] / 'bin/orbis-sentinel-verify'
+            source = Path(__file__).resolve().parents[1]
+            bundle = root / 'bundle'
+            shutil.copytree(source / 'src', bundle / 'src', ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
+            (bundle / 'bin').mkdir()
+            launcher = bundle / 'bin/orbis-sentinel-verify'
+            shutil.copyfile(source / 'bin/orbis-sentinel-verify', launcher)
+            launcher.chmod(0o755)
             result = subprocess.run([str(launcher), '--help'], env={**os.environ, 'PATH': str(root),
                                     'PYTHONPATH': str(root), 'PYTHONUSERBASE': str(root)},
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertFalse(marker.exists())
+            self.assertEqual(list(bundle.rglob('__pycache__')), [])
 
     def test_private_expectation_reads_and_rejects_ambiguous_inputs(self):
         with tempfile.TemporaryDirectory() as temporary:

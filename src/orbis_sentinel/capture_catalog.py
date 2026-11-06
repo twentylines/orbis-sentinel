@@ -8,13 +8,15 @@ import stat
 import sys
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 
 from . import verification as v
 
 _OWNER_UID = 0
 _REQUIRED = {'point.json', 'metadata.orbis', 'core.orbis'}
 _ALLOWED = _REQUIRED | {'capture-draft.orbis', 'wallpaper.orbis', 'icons.orbis'}
+_DRAFT_REQUIRED = {'point.json', 'capture-draft.orbis'}
+_DRAFT_ALLOWED = _DRAFT_REQUIRED | {'wallpaper.orbis', 'icons.orbis'}
 _STAGE = re.compile(r'(?:stage|catalog)-[0-9a-f]{32}\Z')
 _JOB = re.compile(r'[0-9a-f]{32}\Z')
 _MAX_RECORD = 131072
@@ -171,7 +173,7 @@ class CaptureCatalog:
             self._lock = lock
             self._lock_identity = (ls.st_dev, ls.st_ino, ls.st_mode, ls.st_uid, ls.st_gid, ls.st_nlink)
             self._children = {}
-            for name in ('reservations', 'objects', 'work'):
+            for name in ('reservations', 'objects', 'prepared', 'work'):
                 try:
                     os.mkdir(name, 0o700, dir_fd=self._root)
                     os.fsync(self._root)
@@ -296,8 +298,13 @@ class CaptureCatalog:
         finally:
             os.close(source)
 
-    def reserve(self, *, job_id, installation_id, source_sha256, recovery_image_id, reservation, key_fd, data_directory):
-        with self._operation(), self._source_boundary(data_directory):
+    def reserve(self, *, job_id, installation_id, source_sha256, recovery_image_id, reservation, key_fd, data_directory, additional_data_directories=()):
+        with self._operation(), ExitStack() as boundaries:
+            if (not isinstance(additional_data_directories, (tuple, list)) or len(additional_data_directories) > 64
+                    or any(not isinstance(directory, str) for directory in additional_data_directories)):
+                _fail()
+            for directory in dict.fromkeys((data_directory, *additional_data_directories)):
+                boundaries.enter_context(self._source_boundary(directory))
             r = _reservation(reservation)
             record = {'schema': 'orbis-sentinel.capture-reservation.v1', 'jobId': job_id, 'installationId': installation_id, 'sourceSha256': source_sha256, 'recoveryImageId': recovery_image_id, 'reservation': r}
             self._validate_binding(record)
@@ -321,9 +328,9 @@ class CaptureCatalog:
                 os.close(fd)
             return self._get(r['id'])
 
-    def _files(self, fd, recorded=None):
+    def _files(self, fd, recorded=None, *, required=_REQUIRED, allowed=_ALLOWED):
         names = _names(fd)
-        if not _REQUIRED <= names <= _ALLOWED:
+        if not required <= names <= allowed:
             _fail()
         if recorded is not None and (type(recorded) is not dict or set(recorded) != names):
             _fail()
@@ -350,6 +357,118 @@ class CaptureCatalog:
         if _names(fd) != names:
             _fail()
         return files, seals
+
+    @staticmethod
+    def _draft_point(fd, reservation):
+        point = v._json(_read(fd, 'point.json', _LIMITS['point.json'])[0])
+        if (not isinstance(point, dict) or point.get('status') != 'capturing'
+                or any(k not in point for k in reservation)
+                or v._canonical({k: point[k] for k in reservation}) != v._canonical(reservation)):
+            _fail()
+
+    def _draft(self, point, binding):
+        parent = self._children['prepared'][0]
+        fd, seal = _dir(parent, point)
+        try:
+            full_seal = v._seal(os.fstat(fd))
+            if v._mount_id(fd) != self._mount or _names(fd) != {'record.json', 'point'}:
+                _fail()
+            record = _json_read(fd, 'record.json')
+            if (not v._exact(record, ('schema', 'binding', 'preparationSha256', 'sourceHoldSha256', 'files', 'seals'))
+                    or record['schema'] != 'orbis-sentinel.capture-draft.v1'
+                    or v._canonical(record['binding']) != v._canonical(binding)
+                    or any(not isinstance(record[k], str) or not v._HASH.fullmatch(record[k])
+                           for k in ('preparationSha256', 'sourceHoldSha256'))):
+                _fail()
+            pfd, ps = _dir(fd, 'point')
+            try:
+                pfull = v._seal(os.fstat(pfd))
+                if v._mount_id(pfd) != self._mount:
+                    _fail()
+                files, seals = self._files(pfd, record['files'], required=_DRAFT_REQUIRED, allowed=_DRAFT_ALLOWED)
+                if seals != record['seals']:
+                    _fail()
+                self._draft_point(pfd, binding['reservation'])
+                if (v._seal(os.fstat(pfd)) != pfull or v._seal(os.stat('point', dir_fd=fd, follow_symlinks=False)) != pfull
+                        or self._files(pfd, record['files'], required=_DRAFT_REQUIRED, allowed=_DRAFT_ALLOWED) != (files, seals)):
+                    _fail()
+            finally:
+                os.close(pfd)
+            if (v._seal(os.fstat(fd)) != full_seal or v._seal(os.stat(point, dir_fd=parent, follow_symlinks=False)) != full_seal
+                    or _names(fd) != {'record.json', 'point'} or _json_read(fd, 'record.json') != record):
+                _fail()
+            return record
+        finally:
+            os.close(fd)
+
+    @staticmethod
+    def _draft_summary(point, record):
+        return {'id': point, 'dataState': 'retained-unverified', 'lifecycleState': 'unobserved',
+                'preparationSha256': record['preparationSha256'], 'sourceHoldSha256': record['sourceHoldSha256'],
+                'files': sorted(record['files'])}
+
+    def draft(self, point_id):
+        """Observe retained bytes; this grants no verification or lifecycle authority."""
+        with self._operation():
+            binding = self._record(point_id)
+            return self._draft_summary(point_id, self._draft(point_id, binding))
+
+    def retain_draft(self, point_id, *, point_fd, preparation_sha256, source_hold_sha256):
+        """Retain original draft bytes without granting capture or release authority."""
+        with self._operation():
+            binding = self._record(point_id)
+            if (type(point_fd) is not int or point_fd < 0
+                    or fcntl.fcntl(point_fd, fcntl.F_GETFL) & os.O_ACCMODE != os.O_RDONLY
+                    or any(not isinstance(x, str) or not v._HASH.fullmatch(x)
+                           for x in (preparation_sha256, source_hold_sha256))):
+                _fail()
+            initial = os.fstat(point_fd)
+            if (not stat.S_ISDIR(initial.st_mode) or initial.st_uid != _OWNER_UID
+                    or stat.S_IMODE(initial.st_mode) != 0o700):
+                _fail()
+            initial_seal = v._seal(initial)
+            files, source_seals = self._files(point_fd, required=_DRAFT_REQUIRED, allowed=_DRAFT_ALLOWED)
+            self._draft_point(point_fd, binding['reservation'])
+            parent = self._children['prepared'][0]
+            if point_id in _names(parent):
+                record = self._draft(point_id, binding)
+                if (record['files'] != files or record['preparationSha256'] != preparation_sha256
+                        or record['sourceHoldSha256'] != source_hold_sha256):
+                    _fail()
+            else:
+                stage, target = self._stage()
+                try:
+                    os.mkdir('point', 0o700, dir_fd=target)
+                    pfd, _ = _dir(target, 'point')
+                    try:
+                        for name in sorted(files):
+                            digest, size, seal = v._copy(point_fd, name, '/proc/self/fd/%d/%s' % (pfd, name), _LIMITS[name], _OWNER_UID)
+                            if {'bytes': size, 'sha256': digest} != files[name] or list(seal) != source_seals[name]:
+                                _fail()
+                        os.fsync(pfd)
+                        copied, seals = self._files(pfd, required=_DRAFT_REQUIRED, allowed=_DRAFT_ALLOWED)
+                        if copied != files:
+                            _fail()
+                    finally:
+                        os.close(pfd)
+                    if (v._seal(os.fstat(point_fd)) != initial_seal
+                            or self._files(point_fd, files, required=_DRAFT_REQUIRED, allowed=_DRAFT_ALLOWED) != (files, source_seals)):
+                        _fail()
+                    record = {'schema': 'orbis-sentinel.capture-draft.v1', 'binding': binding,
+                              'preparationSha256': preparation_sha256, 'sourceHoldSha256': source_hold_sha256,
+                              'files': files, 'seals': seals}
+                    _write(target, 'record.json', v._canonical(record).encode())
+                    os.fsync(target)
+                    os.rename(stage, point_id, src_dir_fd=self._children['work'][0], dst_dir_fd=parent)
+                    os.fsync(parent)
+                    os.fsync(self._children['work'][0])
+                finally:
+                    os.close(target)
+                record = self._draft(point_id, binding)
+            if (v._seal(os.fstat(point_fd)) != initial_seal
+                    or self._files(point_fd, files, required=_DRAFT_REQUIRED, allowed=_DRAFT_ALLOWED) != (files, source_seals)):
+                _fail()
+            return self._draft_summary(point_id, record)
 
     def _validate_publication(self, pub, expected, reservation, point_fd, files):
         if not v._exact(pub, ('schema', 'core', 'keyId', 'files')) or pub['schema'] != 'orbis.core-capture-catalog-publication.v1' or pub['keyId'] != reservation['envelope']['keyId'] or pub['files'] != files:
