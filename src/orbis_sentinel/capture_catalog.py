@@ -173,7 +173,7 @@ class CaptureCatalog:
             self._lock = lock
             self._lock_identity = (ls.st_dev, ls.st_ino, ls.st_mode, ls.st_uid, ls.st_gid, ls.st_nlink)
             self._children = {}
-            for name in ('reservations', 'objects', 'prepared', 'work'):
+            for name in ('reservations', 'objects', 'prepared', 'publications', 'work'):
                 try:
                     os.mkdir(name, 0o700, dir_fd=self._root)
                     os.fsync(self._root)
@@ -528,6 +528,10 @@ class CaptureCatalog:
     def get(self, point_id):
         with self._operation():
             return self._get(point_id)
+
+    def publish_prepared(self, point_id, **options):
+        from .capture_publication import publish_prepared_capture
+        return publish_prepared_capture(self, point_id, **options)
 
     def list(self):
         with self._operation():

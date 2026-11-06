@@ -13,6 +13,12 @@ CAPABILITY = {
     'operations': ['reserve', 'retain-draft'],
     'mutations': 'private-capture-data-only', 'lifecycleAuthority': False,
 }
+PUBLICATION_CAPABILITY = {
+    'schema': 'orbis-sentinel.capture-publication.v1', 'version': 1,
+    'operations': ['publish'], 'pointVersion': 3,
+    'publicationSchema': 'orbis.core-capture-catalog-publication.v1',
+    'lifecycleAuthority': False, 'incompleteReplay': 'forbidden',
+}
 
 
 def _request(operation):
@@ -24,6 +30,8 @@ def _request(operation):
     fields = (common | {'dataDirectory', 'sourceDirectories', 'jobId', 'installationId', 'sourceSha256',
                         'recoveryImageId', 'reservation'} if operation == 'reserve'
               else common | {'pointId', 'preparationSha256', 'sourceHoldSha256'})
+    if operation == 'publish':
+        fields |= {'expectation', 'terminalSha256'}
     if (not v._exact(value, fields)
             or value['schema'] != 'orbis-sentinel.capture-' + operation + '.v1'
             or v._canonical(value).encode() != body):
@@ -41,21 +49,23 @@ def main(argv=None):
     group.add_argument('--capability', action='store_true')
     group.add_argument('--reserve', action='store_true')
     group.add_argument('--retain-draft', action='store_true')
+    group.add_argument('--publication-capability', action='store_true')
+    group.add_argument('--publish', action='store_true')
     parser.add_argument('--key-fd', type=int)
     parser.add_argument('--point-fd', type=int)
+    parser.add_argument('--checkpoint-fd', type=int)
     args = parser.parse_args(argv)
-    if args.capability:
-        if args.key_fd is not None or args.point_fd is not None:
+    if args.capability or args.publication_capability:
+        if any(fd is not None for fd in (args.key_fd, args.point_fd, args.checkpoint_fd)):
             parser.error('Capability does not accept descriptors')
-        print(v._canonical(CAPABILITY))
+        print(v._canonical(PUBLICATION_CAPABILITY if args.publication_capability else CAPABILITY))
         return 0
     if sys.platform != 'linux' or os.geteuid() != 0:
         print('Capture custody requires the Linux recovery supervisor.', file=sys.stderr)
         return 1
-    operation = 'reserve' if args.reserve else 'retain-draft'
-    descriptor = args.key_fd if args.reserve else args.point_fd
-    if (descriptor is None or descriptor < 3
-            or (args.point_fd is not None if args.reserve else args.key_fd is not None)):
+    operation = 'reserve' if args.reserve else 'publish' if args.publish else 'retain-draft'
+    descriptor = args.key_fd if args.reserve else args.checkpoint_fd if args.publish else args.point_fd
+    if descriptor is None or descriptor < 3 or sum(fd is not None for fd in (args.key_fd, args.point_fd, args.checkpoint_fd)) != 1:
         parser.error('Choose the descriptor for this operation')
     try:
         request = _request(operation)
@@ -68,15 +78,24 @@ def main(argv=None):
                     data_directory=request['dataDirectory'],
                     additional_data_directories=request['sourceDirectories'],
                 )
-            else:
+            elif args.retain_draft:
                 result = catalog.retain_draft(
                     request['pointId'], point_fd=descriptor,
                     preparation_sha256=request['preparationSha256'],
                     source_hold_sha256=request['sourceHoldSha256'],
                 )
+            else:
+                result = catalog.publish_prepared(
+                    request['pointId'], expectation=request['expectation'], checkpoint_fd=descriptor,
+                    preparation_sha256=request['preparationSha256'], source_hold_sha256=request['sourceHoldSha256'],
+                    terminal_sha256=request['terminalSha256'],
+                )
         print(v._canonical({'schema': 'orbis-sentinel.capture-custody-result.v1',
                             'operation': operation, 'result': result}))
         return 0
+    except v.CleanupIndeterminate:
+        print('Capture publication stopped. Worker cleanup needs review; recovery information was kept.', file=sys.stderr)
+        return 2
     except (OSError, ValueError, CatalogError):
         print('Capture data could not be retained. Existing recovery information was kept.', file=sys.stderr)
         return 1

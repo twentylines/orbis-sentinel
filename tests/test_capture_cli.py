@@ -24,8 +24,11 @@ class CaptureCliTests(unittest.TestCase):
             catalog = factory.return_value.__enter__.return_value
             catalog.reserve.return_value = {'id': 'test', 'dataState': 'reserved'}
             catalog.retain_draft.return_value = {'id': 'test', 'dataState': 'retained-unverified'}
+            catalog.publish_prepared.return_value = {'id': 'test', 'dataState': 'verified', 'lifecycleState': 'unobserved'}
             catalog.reserve.side_effect = failure
-            args = ['--reserve', '--key-fd', '3'] if operation == 'reserve' else ['--retain-draft', '--point-fd', '4']
+            catalog.publish_prepared.side_effect = failure
+            args = (['--reserve', '--key-fd', '3'] if operation == 'reserve' else ['--publish', '--checkpoint-fd', '5']
+                    if operation == 'publish' else ['--retain-draft', '--point-fd', '4'])
             status = cli.main(args)
         return status, output.getvalue(), errors.getvalue(), factory, catalog
 
@@ -57,6 +60,27 @@ class CaptureCliTests(unittest.TestCase):
         catalog.retain_draft.assert_called_once_with('test', point_fd=4, preparation_sha256='a' * 64,
                                                     source_hold_sha256='b' * 64)
         self.assertEqual(json.loads(output)['result']['dataState'], 'retained-unverified')
+
+    def test_publication_passes_checkpoint_and_original_authority_bindings(self):
+        request = {'schema': 'orbis-sentinel.capture-publish.v1', 'catalogDirectory': '/catalog',
+                   'pointId': 'test', 'preparationSha256': 'a' * 64, 'sourceHoldSha256': 'b' * 64,
+                   'terminalSha256': 'c' * 64, 'expectation': {'pointId': 'test'}}
+        status, output, errors, _, catalog = self.invoke('publish', request)
+        self.assertEqual(status, 0)
+        self.assertFalse(errors)
+        catalog.publish_prepared.assert_called_once_with('test', checkpoint_fd=5, expectation=request['expectation'],
+                                                        preparation_sha256='a' * 64, source_hold_sha256='b' * 64,
+                                                        terminal_sha256='c' * 64)
+        self.assertEqual(json.loads(output)['result']['lifecycleState'], 'unobserved')
+
+    def test_uncertain_publication_cleanup_is_a_distinct_exit(self):
+        request = {'schema': 'orbis-sentinel.capture-publish.v1', 'catalogDirectory': '/catalog',
+                   'pointId': 'test', 'preparationSha256': 'a' * 64, 'sourceHoldSha256': 'b' * 64,
+                   'terminalSha256': 'c' * 64, 'expectation': {'pointId': 'test'}}
+        status, output, errors, _, _ = self.invoke('publish', request, failure=v.CleanupIndeterminate('private details'))
+        self.assertEqual(status, 2)
+        self.assertFalse(output)
+        self.assertNotIn('private details', errors)
 
     def test_unsupported_or_unprivileged_requests_do_not_open_catalog(self):
         for request, root in ((self.reservation(), False), ({**self.reservation(), 'execute': True}, True)):

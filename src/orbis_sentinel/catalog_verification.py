@@ -86,3 +86,90 @@ def verify_catalog_capture(*, data_directory, scratch_directory, image_id, expec
         raise
     except Exception:
         raise v.VerificationError('Complete capture verification failed') from None
+
+
+def verify_owned_catalog_workspace(*, workspace_directory, image_id, expectation, owner_id,
+                                   created_at, master_key_fd, runner=None):
+    """Internal publication path for an exclusively owned, quiescent seal workspace.
+
+    Unlike external Orbis data, this data was assembled under the catalog lock
+    and its owned sealing container has exited and been removed. Verify in place
+    to avoid a second full archive copy. The catalog adopts it only afterwards.
+    """
+    from . import capture_catalog as c
+    if sys.platform != 'linux' or os.geteuid() != 0:
+        v._fail()
+    expected, encoded = v._expectation(expectation)
+    if not isinstance(image_id, str) or not v._IMAGE.fullmatch(image_id):
+        v._fail()
+    snapshot = os.path.basename(workspace_directory)
+    if not re.fullmatch(r'catalog-[a-f0-9]{32}', snapshot):
+        v._fail()
+    v._secure_scratch(workspace_directory, 0)
+    descriptors, bindings = [], []
+    try:
+        root = v._open_absolute(workspace_directory)
+        descriptors.append(root)
+        root_seal = v._dirseal(os.fstat(root))
+        if root_seal[2] & 0o7777 != 0o700 or root_seal[3] != 0:
+            v._fail()
+        parent = root
+        for name in ('data', 'backups', 'time-machine'):
+            child, before = v._directory(parent, name, 0)
+            descriptors.append(child)
+            bindings.append((parent, name, child, v._dirseal(before)))
+            parent = child
+        base = parent
+        points, before = v._directory(base, 'points', 0)
+        descriptors.append(points)
+        bindings.append((base, 'points', points, v._dirseal(before)))
+        point, before = v._directory(points, expected['pointId'], 0)
+        descriptors.append(point)
+        bindings.append((points, expected['pointId'], point, v._dirseal(before)))
+        keys, before = v._directory(base, 'keys', 0)
+        descriptors.append(keys)
+        bindings.append((base, 'keys', keys, v._dirseal(before)))
+        if set(os.listdir(keys)) != {'master-v1.key'}:
+            v._fail()
+        hashes, seals = {}, {}
+        names = set(os.listdir(point))
+        if not c._REQUIRED <= names <= c._ALLOWED:
+            v._fail()
+        for name in names:
+            _, digest, item = c._read(point, name, c._LIMITS[name], collect=False)
+            hashes[name], seals[name] = (digest, item.st_size), v._seal(item)
+        value = v._json(c._read(point, 'point.json', 32768)[0])
+        _, key_digest, key_item = c._read(keys, 'master-v1.key', 32, 32)
+        _, original_digest, original_item = c._read_fd(master_key_fd, 32, 32)
+        if key_digest != original_digest:
+            v._fail()
+        hashes['key'] = (key_digest, 32)
+        audit = os.path.join(workspace_directory, 'catalog-verification')
+        os.mkdir(audit, 0o700)
+        transport = runner if runner is not None else _CatalogDocker()
+        class BoundData:
+            def __getattr__(self, name):
+                return getattr(transport, name)
+
+            def create(self, name, nonce, image, _data, _staging, args):
+                data = os.path.join(workspace_directory, 'data')
+                return transport.create(name, nonce, image, data,
+                                        os.path.join(data, 'backups/time-machine/core-verification'), args)
+        result = v._execute_worker(BoundData(), audit, image_id, encoded,
+                                   lambda output: _validate(output, expected, value, hashes, owner_id, created_at))
+        if (set(os.listdir(point)) != names or v._seal(os.fstat(master_key_fd)) != v._seal(original_item)
+                or v._seal(os.stat('master-v1.key', dir_fd=keys, follow_symlinks=False)) != v._seal(key_item)):
+            v._fail()
+        for name, seal in seals.items():
+            if v._seal(os.stat(name, dir_fd=point, follow_symlinks=False)) != seal:
+                v._fail()
+        for ancestor, name, child, seal in bindings:
+            if (v._dirseal(os.fstat(child)) != seal
+                    or v._dirseal(os.stat(name, dir_fd=ancestor, follow_symlinks=False)) != seal):
+                v._fail()
+        if v._dirseal(os.stat(workspace_directory, follow_symlinks=False)) != root_seal:
+            v._fail()
+        return CatalogVerificationResult(publication=result, snapshot_id=snapshot)
+    finally:
+        for fd in reversed(descriptors):
+            os.close(fd)
