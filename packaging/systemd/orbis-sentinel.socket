@@ -1,0 +1,12 @@
+[Unit]
+Description=Orbis Sentinel local API socket
+
+[Socket]
+ListenStream=/run/orbis-sentinel/api.sock
+SocketMode=0600
+DirectoryMode=0755
+FileDescriptorName=api
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

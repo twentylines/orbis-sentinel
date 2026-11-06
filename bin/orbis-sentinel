@@ -1,0 +1,12 @@
+#!/usr/bin/env python3
+"""Launch the bundled source without loading user site packages."""
+
+from pathlib import Path
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+
+from orbis_sentinel.runtime import main
+
+if __name__ == "__main__":
+    raise SystemExit(main())

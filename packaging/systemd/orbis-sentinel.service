@@ -1,0 +1,36 @@
+[Unit]
+Description=Orbis Sentinel local status and telemetry
+Requires=orbis-sentinel.socket
+After=orbis-sentinel.socket
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -I /opt/orbis-sentinel/current/bin/orbis-sentinel --systemd-socket
+DynamicUser=yes
+UMask=0077
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=5
+KillMode=control-group
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectClock=yes
+RestrictAddressFamilies=AF_UNIX
+CapabilityBoundingSet=
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+Environment=PYTHONDONTWRITEBYTECODE=1
+
+[Install]
+WantedBy=multi-user.target
