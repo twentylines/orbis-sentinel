@@ -227,7 +227,29 @@ def _copy(parent, name, destination, maximum, owner, exact=None):
         os.close(source)
 
 
-def _snapshot(data, scratch, expected, owner):
+def _copy_key_descriptor(source, destination, owner):
+    before = os.fstat(source)
+    if (not stat.S_ISREG(before.st_mode) or before.st_uid != owner or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode) not in (0o400, 0o600) or before.st_size != 32):
+        _fail()
+    value = os.pread(source, 33, 0)
+    if len(value) != 32 or _seal(before) != _seal(os.fstat(source)):
+        _fail()
+    target = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    try:
+        remaining = memoryview(value)
+        while remaining:
+            written = os.write(target, remaining)
+            if not written:
+                _fail()
+            remaining = remaining[written:]
+        os.fsync(target)
+    finally:
+        os.close(target)
+    return hashlib.sha256(value).hexdigest(), 32, _seal(before)
+
+
+def _snapshot_point(data, scratch, expected, owner, *, master_key_fd=None, include_assets=False):
     data_fd = _open_absolute(data)
     try:
         scratch_fd = _open_absolute(scratch)
@@ -241,7 +263,7 @@ def _snapshot(data, scratch, expected, owner):
         if ds.st_uid != owner or ds.st_mode & 0o022 or ss.st_uid != owner or stat.S_IMODE(ss.st_mode) != 0o700 or os.path.commonpath([data, scratch]) in (data, scratch):
             _fail()
         _require_disjoint(data, data_fd, scratch, scratch_fd)
-        name = 'capture-' + secrets.token_hex(16)
+        name = ('catalog-' if include_assets else 'capture-') + secrets.token_hex(16)
         os.mkdir(name, 0o700, dir_fd=scratch_fd)
         root = os.path.join(scratch, name)
         destination = os.path.join(root, 'data', 'backups', 'time-machine')
@@ -260,12 +282,14 @@ def _snapshot(data, scratch, expected, owner):
         dirs.append((base, 'points', points, points_s))
         point, point_s = _directory(points, expected['pointId'], owner)
         dirs.append((points, expected['pointId'], point, point_s))
-        keys, keys_s = _directory(base, 'keys', owner)
-        dirs.append((base, 'keys', keys, keys_s))
+        keys = None
+        if master_key_fd is None:
+            keys, keys_s = _directory(base, 'keys', owner)
+            dirs.append((base, 'keys', keys, keys_s))
         required = {'point.json', 'metadata.orbis', 'core.orbis'}
         permitted = required | {'capture-draft.orbis', 'wallpaper.orbis', 'icons.orbis'}
         point_names = set(os.listdir(point))
-        if not required <= point_names <= permitted or set(os.listdir(keys)) != {'master-v1.key'}:
+        if not required <= point_names <= permitted or (keys is not None and set(os.listdir(keys)) != {'master-v1.key'}):
             _fail()
         extras = {}
         for extra in point_names - required:
@@ -281,14 +305,26 @@ def _snapshot(data, scratch, expected, owner):
         hashes = {}
         for filename, limit in (('point.json', 32768), ('metadata.orbis', 524340), ('core.orbis', _LIMIT)):
             hashes[filename] = _copy(point, filename, os.path.join(target, filename), limit, owner)
-        hashes['key'] = _copy(keys, 'master-v1.key', os.path.join(destination, 'keys', 'master-v1.key'), 32, owner, 32)
-        for parent_fd, filename, key in ((point, 'point.json', 'point.json'), (point, 'metadata.orbis', 'metadata.orbis'), (point, 'core.orbis', 'core.orbis'), (keys, 'master-v1.key', 'key')):
-            if _seal(os.stat(filename, dir_fd=parent_fd, follow_symlinks=False)) != hashes[key][2]:
+        if include_assets:
+            limits = {'capture-draft.orbis': 524340, 'wallpaper.orbis': 32 * 1024**2 + 52,
+                      'icons.orbis': 24 * 1024**2 + 52}
+            for filename in sorted(point_names - required):
+                hashes[filename] = _copy(point, filename, os.path.join(target, filename), limits[filename], owner)
+        key_target = os.path.join(destination, 'keys', 'master-v1.key')
+        hashes['key'] = (_copy(keys, 'master-v1.key', key_target, 32, owner, 32) if keys is not None
+                         else _copy_key_descriptor(master_key_fd, key_target, owner))
+        for filename in sorted(point_names if include_assets else required):
+            if _seal(os.stat(filename, dir_fd=point, follow_symlinks=False)) != hashes[filename][2]:
                 _fail()
+        if keys is not None:
+            if _seal(os.stat('master-v1.key', dir_fd=keys, follow_symlinks=False)) != hashes['key'][2]:
+                _fail()
+        elif _seal(os.fstat(master_key_fd)) != hashes['key'][2]:
+            _fail()
         for extra, before in extras.items():
             if _seal(os.stat(extra, dir_fd=point, follow_symlinks=False)) != before:
                 _fail()
-        if set(os.listdir(point)) != point_names or set(os.listdir(keys)) != {'master-v1.key'} or os.path.realpath(data) != data or os.path.realpath(scratch) != scratch:
+        if set(os.listdir(point)) != point_names or (keys is not None and set(os.listdir(keys)) != {'master-v1.key'}) or os.path.realpath(data) != data or os.path.realpath(scratch) != scratch:
             _fail()
         for p, component, fd, before in dirs:
             if _dirseal(before) != _dirseal(os.fstat(fd)) or _dirseal(before) != _dirseal(os.stat(component, dir_fd=p, follow_symlinks=False)):
@@ -313,8 +349,13 @@ def _snapshot(data, scratch, expected, owner):
         os.close(scratch_fd)
 
 
+def _snapshot(data, scratch, expected, owner):
+    return _snapshot_point(data, scratch, expected, owner)
+
+
 class _Docker:
     """The only process transport: fixed local Docker binary and daemon."""
+    _WORKER = '/app/core-capture-publication.mjs'
     def _run(self, arguments, timeout=30):
         proc = subprocess.Popen(['/usr/bin/docker', '--host', 'unix:///var/run/docker.sock', *arguments], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env={'PATH': '/usr/bin:/bin', 'LANG': 'C', 'HOME': '/'}, close_fds=True)
         output = [bytearray(), bytearray()]
@@ -346,7 +387,7 @@ class _Docker:
         return code, bytes(output[0])
 
     def create(self, name, nonce, image, data, staging, encoded):
-        args = ['create', '--pull=never', '--name', name, '--label', 'orbis.sentinel.verifier=' + nonce, '--network', 'none', '--ipc', 'none', '--no-healthcheck', '--restart', 'no', '--cpus', '1', '--read-only', '--user', '0:0', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--pids-limit', '128', '--memory', '2g', '--tmpfs', '/tmp:rw,nosuid,nodev,noexec,size=64m', '--mount', 'type=bind,src=' + data + ',dst=/data,readonly', '--mount', 'type=bind,src=' + staging + ',dst=/data/backups/time-machine/core-verification', '--entrypoint', '/usr/local/bin/node', image, '/app/core-capture-publication.mjs', '--verify', encoded]
+        args = ['create', '--pull=never', '--name', name, '--label', 'orbis.sentinel.verifier=' + nonce, '--network', 'none', '--ipc', 'none', '--no-healthcheck', '--restart', 'no', '--cpus', '1', '--read-only', '--user', '0:0', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--pids-limit', '128', '--memory', '2g', '--tmpfs', '/tmp:rw,nosuid,nodev,noexec,size=64m', '--mount', 'type=bind,src=' + data + ',dst=/data,readonly', '--mount', 'type=bind,src=' + staging + ',dst=/data/backups/time-machine/core-verification', '--entrypoint', '/usr/local/bin/node', image, self._WORKER, '--verify', encoded]
         code, body = self._run(args)
         if code:
             raise VerificationError('Verifier container creation failed')
@@ -415,6 +456,64 @@ def _publication(result, expected, point, hashes, owner, created):
     return result
 
 
+def _execute_worker(transport, root, image_id, encoded, validate):
+    nonce = secrets.token_hex(16)
+    name = 'orbis-sentinel-verifier-' + nonce
+    receipt = os.path.join(root, 'verifier-receipt.jsonl')
+    with open(receipt, 'x', encoding='ascii') as stream:
+        os.chmod(receipt, 0o600)
+        stream.write(_canonical({'name': name, 'nonce': nonce, 'image': image_id}))
+        stream.flush()
+        os.fsync(stream.fileno())
+    receipt_dir = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(receipt_dir)
+    finally:
+        os.close(receipt_dir)
+    container = None
+    creation_indeterminate = False
+    failure = None
+    result = None
+    try:
+        try:
+            container = transport.create(name, nonce, image_id, os.path.join(root, 'data'), os.path.join(root, 'data', 'backups', 'time-machine', 'core-verification'), encoded)
+        except Exception:
+            creation_indeterminate = True
+            container = transport.find(name, nonce)
+            if container is not None:
+                creation_indeterminate = False
+                with open(receipt, 'a', encoding='ascii') as stream:
+                    stream.write('\n' + _canonical({'containerId': container}) + '\n')
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            raise
+        with open(receipt, 'a', encoding='ascii') as stream:
+            stream.write('\n' + _canonical({'containerId': container}) + '\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+        _owned(transport, container, name, nonce, image_id)
+        code, output = transport.start(container)
+        info = _owned(transport, container, name, nonce, image_id)
+        if code != 0 or info.get('State', {}).get('Running') is not False or info.get('State', {}).get('ExitCode') != 0 or len(output) > 8192:
+            _fail()
+        result = validate(_json(output))
+    except Exception as exc:
+        failure = exc
+    try:
+        if container is not None:
+            _owned(transport, container, name, nonce, image_id)
+            transport.remove(container)
+        if (container is not None and transport.exists(container)) or transport.find(name, nonce) is not None:
+            raise CleanupIndeterminate('Verifier cleanup is indeterminate')
+    except Exception:
+        raise CleanupIndeterminate('Verifier cleanup is indeterminate') from None
+    if creation_indeterminate:
+        raise CleanupIndeterminate('Verifier creation is indeterminate') from None
+    if failure is not None:
+        raise VerificationError('Saved capture verification failed') from None
+    return result
+
+
 def verify_saved_capture(*, data_directory, scratch_directory, image_id, expectation, owner_id, created_at, runner=None):
     """Verify an isolated copy and retain it; snapshot_id is relative to scratch_directory.
 
@@ -430,60 +529,8 @@ def verify_saved_capture(*, data_directory, scratch_directory, image_id, expecta
         snapshot_id, root, point, hashes = _snapshot(data_directory, scratch_directory, expected, 0)
         _secure_scratch(scratch_directory, 0)
         transport = runner if runner is not None else _Docker()
-        nonce = secrets.token_hex(16)
-        name = 'orbis-sentinel-verifier-' + nonce
-        receipt = os.path.join(root, 'verifier-receipt.jsonl')
-        with open(receipt, 'x', encoding='ascii') as stream:
-            os.chmod(receipt, 0o600)
-            stream.write(_canonical({'name': name, 'nonce': nonce, 'image': image_id}))
-            stream.flush()
-            os.fsync(stream.fileno())
-        receipt_dir = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        try:
-            os.fsync(receipt_dir)
-        finally:
-            os.close(receipt_dir)
-        container = None
-        creation_indeterminate = False
-        failure = None
-        result = None
-        try:
-            try:
-                container = transport.create(name, nonce, image_id, os.path.join(root, 'data'), os.path.join(root, 'data', 'backups', 'time-machine', 'core-verification'), encoded)
-            except Exception:
-                creation_indeterminate = True
-                container = transport.find(name, nonce)
-                if container is not None:
-                    creation_indeterminate = False
-                    with open(receipt, 'a', encoding='ascii') as stream:
-                        stream.write('\n' + _canonical({'containerId': container}) + '\n')
-                        stream.flush()
-                        os.fsync(stream.fileno())
-                raise
-            with open(receipt, 'a', encoding='ascii') as stream:
-                stream.write('\n' + _canonical({'containerId': container}) + '\n')
-                stream.flush()
-                os.fsync(stream.fileno())
-            _owned(transport, container, name, nonce, image_id)
-            code, output = transport.start(container)
-            info = _owned(transport, container, name, nonce, image_id)
-            if code != 0 or info.get('State', {}).get('Running') is not False or info.get('State', {}).get('ExitCode') != 0 or len(output) > 8192:
-                _fail()
-            result = _publication(_json(output), expected, point, hashes, owner_id, created_at)
-        except Exception as exc:
-            failure = exc
-        try:
-            if container is not None:
-                _owned(transport, container, name, nonce, image_id)
-                transport.remove(container)
-            if (container is not None and transport.exists(container)) or transport.find(name, nonce) is not None:
-                raise CleanupIndeterminate('Verifier cleanup is indeterminate')
-        except Exception:
-            raise CleanupIndeterminate('Verifier cleanup is indeterminate') from None
-        if creation_indeterminate:
-            raise CleanupIndeterminate('Verifier creation is indeterminate') from None
-        if failure is not None:
-            raise VerificationError('Saved capture verification failed') from None
+        result = _execute_worker(transport, root, image_id, encoded,
+                                 lambda value: _publication(value, expected, point, hashes, owner_id, created_at))
         summary = _canonical({
             'schema': 'orbis-sentinel.capture-data-verification.v1',
             'snapshotId': snapshot_id, 'imageId': image_id, 'expectation': expected,
