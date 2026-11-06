@@ -37,3 +37,13 @@ The profile files comprise `packaging/sysusers.d/orbis-sentinel-observer.conf`, 
 Enable the profile only during an idle, verified helper enrollment. Its socket descriptor is passed to the existing host daemon, which owns all privileged records and operations. The observer serves only a fixed capability and sanitized update progress. It cannot invoke update, restart, restore, routing cleanup or other mutation endpoints. Disabling the profile makes Sentinel's progress unavailable while its local service continues to run.
 
 Licensed under the GNU General Public License v3. See [LICENSE](LICENSE).
+
+## Offline capture verification
+
+The root-only `bin/orbis-sentinel-verify` command can verify an existing sealed Orbis core capture while the main Orbis container is unavailable. It uses a locally retained, independently approved recovery image containing the compatible publication worker. The image must be supplied by its immutable `sha256:` image ID; the command never downloads an image.
+
+The command copies only the selected point's encrypted core, encrypted metadata, point record and master key into a private retained workspace. The verification container has no network, a read-only filesystem and input mount, no capabilities, and a separate writable staging directory. It authenticates the encrypted payload and retained image archives using the existing Orbis format. Dashboard previews are not verified by this command.
+
+Run `python3 -I bin/orbis-sentinel-verify --help` for the operator arguments. The scratch directory must already exist, be root-owned mode `0700`, and have protected root-owned ancestors. The checkpoint expectation, owner and creation time must come from the protected supervisor's original capture records. An image ID pins bytes; the supervisor must separately establish that the retained image is trusted and compatible.
+
+Success reports data verification only. It does not start Orbis, restore files, adopt a capture, release a maintenance hold or authorize recovery. Private workspace and container identity records remain for reconciliation. Exit status `2` means verifier cleanup is uncertain; do not repeat the operation until its retained identity record has been reviewed. This command is not yet connected to the recovery UI or capture completion service.
