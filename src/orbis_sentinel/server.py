@@ -22,14 +22,18 @@ _TOKEN = re.compile(rb"[!#$%&'*+.^_`|~0-9A-Za-z-]+\Z")
 _MAX_HEADERS = 16384
 _MAX_LINE = 8192
 _MAX_BODY = 1048576
+_CAPTURE_ROUTE = re.compile(re.escape(API_PREFIX) + r"/captures/([a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12})/progress\Z")
 
 
 class SentinelServer:
     def __init__(self, socket_path, providers, *, listener=None, allowed_uids=None,
-                 max_connections=8, request_timeout=2.0):
+                 max_connections=8, request_timeout=2.0, capture_provider=None):
         if not hasattr(providers, "items"):
             raise TypeError("providers must be a mapping")
         self.providers = dict(providers)
+        if capture_provider is not None and not callable(capture_provider):
+            raise TypeError("capture_provider must be callable")
+        self.capture_provider = capture_provider
         if not set(self.providers) <= _ROUTES or any(not callable(v) for v in self.providers.values()):
             raise ValueError("providers must map supported routes to callbacks")
         if type(max_connections) is not int or not 1 <= max_connections <= 64:
@@ -199,10 +203,12 @@ class SentinelServer:
             path = parts[1].decode("ascii")
         except UnicodeDecodeError:
             return error("400 Bad Request")
-        if path not in self.providers:
+        capture = _CAPTURE_ROUTE.fullmatch(path) if self.capture_provider is not None else None
+        if path not in self.providers and capture is None:
             return error("404 Not Found")
         try:
-            body = json.dumps(self.providers[path](), allow_nan=False, separators=(",", ":"), ensure_ascii=True).encode("ascii")
+            value = self.capture_provider(capture[1]) if capture is not None else self.providers[path]()
+            body = json.dumps(value, allow_nan=False, separators=(",", ":"), ensure_ascii=True).encode("ascii")
             if len(body) > _MAX_BODY:
                 raise ValueError("response too large")
         except Exception:

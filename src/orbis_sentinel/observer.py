@@ -16,6 +16,24 @@ _SAFE = 2 ** 53 - 1
 _ID = re.compile(r"[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}", re.ASCII)
 _TAG = re.compile(r"v[0-9]+\.[0-9]+\.[0-9]+(?:[-.][0-9A-Za-z.-]+)?", re.ASCII)
 _CAPABILITY = {"schema": "orbis.sentinel-observer.v1", "protocolVersion": 1, "kind": "core-update-progress"}
+_CAPTURE_CAPABILITY = {"schema": "orbis.sentinel-observer.capture.v1", "protocolVersion": 1, "kind": "core-capture-progress"}
+
+
+def validate_capture(value, point):
+    fields = {"version", "id", "state", "phase", "completedBytes", "totalBytes", "restartVerified"}
+    phases = {"preparing", "stopping-orbis", "saving-orbis", "starting-orbis", "stopping-apps",
+              "saving-apps", "starting-apps", "sealing", "complete"}
+    if (not _exact(value, fields) or type(value["version"]) is not int or value["version"] != 1
+            or type(point) is not str or not _ID.fullmatch(point) or value["id"] != point
+            or type(value["state"]) is not str or value["state"] not in {"waiting", "running", "recovery-required", "complete"}
+            or type(value["phase"]) is not str or value["phase"] not in phases
+            or not _count(value["completedBytes"]) or not (value["totalBytes"] is None or _count(value["totalBytes"]))
+            or value["totalBytes"] is not None and value["completedBytes"] > value["totalBytes"]
+            or type(value["restartVerified"]) is not bool
+            or (value["state"] == "complete") != (value["phase"] == "complete")
+            or value["restartVerified"] != (value["state"] == "complete")):
+        raise ValueError("capture progress is unavailable")
+    return dict(value)
 
 
 def _exact(value, keys):
@@ -143,23 +161,54 @@ class ObserverClient:
                 raise ValueError("observer identity or response changed")
         return json.loads(body.decode("utf-8"), object_pairs_hook=_pairs)
 
-    def read(self):
-        deadline = time.monotonic() + 2
+    def read(self, *, deadline=None):
+        deadline = time.monotonic() + 2 if deadline is None else deadline
         capability = self._exchange("/v1/capability", deadline)
         if capability != _CAPABILITY or type(capability.get("protocolVersion")) is not int:
             raise ValueError("observer capability is unavailable")
         return validate_progress(self._exchange("/v1/core-operation/progress", deadline))
 
+    def read_capture(self, point, *, deadline=None):
+        if type(point) is not str or not _ID.fullmatch(point):
+            raise ValueError("invalid capture identity")
+        deadline = time.monotonic() + 2 if deadline is None else deadline
+        capability = self._exchange("/v2/capture-capability", deadline)
+        if capability != _CAPTURE_CAPABILITY or type(capability.get("protocolVersion")) is not int:
+            raise ValueError("capture observer is unavailable")
+        return validate_capture(self._exchange("/v2/core-captures/" + point + "/progress", deadline), point)
+
 
 def _observer_worker(output, paths, interval):
     client = ObserverClient(paths[0])
     output.setblocking(False)
+    point = None
+    interested_until = 0
     try:
         while True:
             started = time.monotonic()
-            sample = {"schema": "orbis-sentinel.progress-sample.v1", "available": False, "progress": None}
+            # One active capture per installation; viewers share one observation.
+            # Interest expires after the last viewer leaves, including tab close.
+            for _ in range(8):
+                try:
+                    request = json.loads(output.recv(1024), object_pairs_hook=_pairs)
+                    if (_exact(request, {"capture"}) and type(request["capture"]) is str
+                            and _ID.fullmatch(request["capture"])):
+                        point = request["capture"]
+                        interested_until = started + 15
+                except (OSError, ValueError, TypeError, RecursionError):
+                    break
+            if started >= interested_until:
+                point = None
+            sample = {"schema": "orbis-sentinel.progress-sample.v1", "available": False,
+                      "progress": None, "capture": None}
+            deadline = started + 2
+            if point is not None:
+                try:
+                    sample["capture"] = client.read_capture(point, deadline=deadline)
+                except (OSError, ValueError, TypeError, OverflowError, RecursionError):
+                    pass
             try:
-                sample.update(available=True, progress=client.read())
+                sample.update(available=True, progress=client.read(deadline=deadline))
             except (OSError, ValueError, TypeError, OverflowError, RecursionError):
                 pass
             try:
@@ -184,3 +233,25 @@ class ObserverCollector(TelemetryCollector):
         available = value["state"] == "ready" and type(sample) is dict and sample.get("available") is True
         return {"schema": "orbis-sentinel.progress.v1", "available": available,
                 "progress": sample["progress"] if available else None, "ageMs": value["ageMs"], "sourceState": value["state"]}
+
+    def capture_snapshot(self, point):
+        if type(point) is not str or not _ID.fullmatch(point):
+            raise ValueError("invalid capture identity")
+        with self.lock:
+            if not self.closed and self.receiver is not None:
+                try:
+                    self.receiver.send(json.dumps({"capture": point}, separators=(",", ":")).encode())
+                except (OSError, ValueError):
+                    pass
+        value = super().snapshot()
+        progress = value["sample"].get("capture") if type(value["sample"]) is dict else None
+        available = False
+        if value["state"] == "ready":
+            try:
+                progress = validate_capture(progress, point)
+                available = True
+            except (ValueError, TypeError):
+                progress = None
+        return {"schema": "orbis-sentinel.capture-progress.v1", "id": point,
+                "available": available, "progress": progress if available else None,
+                "ageMs": value["ageMs"], "sourceState": value["state"]}

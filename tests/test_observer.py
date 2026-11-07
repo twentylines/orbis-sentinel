@@ -8,7 +8,15 @@ import time
 import unittest
 from unittest.mock import patch
 
-from orbis_sentinel.observer import ObserverClient, ObserverCollector, validate_progress
+from orbis_sentinel.observer import ObserverClient, ObserverCollector, validate_progress, validate_capture, _observer_worker
+
+
+POINT = "12345678-1234-4123-8123-123456789abc"
+
+
+def capture():
+    return {"version": 1, "id": POINT, "state": "running", "phase": "starting-orbis",
+            "completedBytes": 0, "totalBytes": None, "restartVerified": False}
 
 
 def progress(phase="restarting"):
@@ -17,6 +25,18 @@ def progress(phase="restarting"):
 
 
 class ValidationTests(unittest.TestCase):
+    def test_capture_exact_identity_completion_and_unknown_counts(self):
+        self.assertEqual(validate_capture(capture(), POINT), capture())
+        for key, bad in (("id", "0" * 36), ("version", True), ("completedBytes", True),
+                         ("completedBytes", 2 ** 53), ("totalBytes", -1), ("phase", "complete"),
+                         ("restartVerified", True), ("extra", "private")):
+            with self.subTest(key=key, bad=bad), self.assertRaises(ValueError):
+                validate_capture({**capture(), key: bad}, POINT)
+        complete = {**capture(), "state": "complete", "phase": "complete", "restartVerified": True}
+        self.assertEqual(validate_capture(complete, POINT), complete)
+        with self.assertRaises(ValueError):
+            validate_capture({**capture(), "completedBytes": 2, "totalBytes": 1}, POINT)
+
     def test_all_phases_and_no_job_are_observations_only(self):
         self.assertEqual(validate_progress({"version": 1, "job": None}), {"version": 1, "job": None})
         for phase in (None, "downloading", "installing", "restarting", "verifying", "recovering"):
@@ -108,6 +128,26 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(self.client.read(), progress())
         self.assertEqual(self.calls, ["/v1/capability", "/v1/core-operation/progress"])
 
+    def test_capture_negotiates_separately_and_cannot_cross_points(self):
+        capability = {"schema": "orbis.sentinel-observer.capture.v1", "protocolVersion": 1, "kind": "core-capture-progress"}
+        self.respond = lambda route: capability if route == "/v2/capture-capability" else capture()
+        self.assertEqual(self.client.read_capture(POINT), capture())
+        self.assertEqual(self.calls, ["/v2/capture-capability", "/v2/core-captures/" + POINT + "/progress"])
+        self.calls.clear()
+        for value in (POINT + "?x=1", "../" + POINT, POINT.upper(), None):
+            with self.assertRaises(ValueError):
+                self.client.read_capture(value)
+        self.assertEqual(self.calls, [])
+        self.respond = lambda route: capability if route == "/v2/capture-capability" else {**capture(), "id": "00000000-0000-4000-8000-000000000000"}
+        with self.assertRaises(ValueError):
+            self.client.read_capture(POINT)
+
+    def test_old_observer_does_not_get_forced_into_capture_support(self):
+        with self.assertRaises(ValueError):
+            self.client.read_capture(POINT)
+        self.assertEqual(self.calls, ["/v2/capture-capability"])
+        self.assertEqual(self.client.read(), progress())
+
     def test_wrong_server_peer_is_refused_before_any_http(self):
         self.peer.stop()
         self.peer = patch.object(self.client, "_peer_uid", return_value=12345)
@@ -138,6 +178,51 @@ class ClientTests(unittest.TestCase):
 
 
 class CollectorTests(unittest.TestCase):
+    def test_shared_worker_collects_on_demand_with_one_deadline_and_expires_interest(self):
+        class Finished(BaseException):
+            pass
+        calls = []
+        class Client:
+            def __init__(self, path):
+                self.reads = 0
+            def read_capture(self, point, *, deadline):
+                calls.append(('capture', point, deadline))
+                return capture()
+            def read(self, *, deadline):
+                self.reads += 1
+                if self.reads > 2:
+                    raise Finished
+                calls.append(('update', deadline))
+                return progress()
+        output, receiver = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+        self.addCleanup(receiver.close)
+        receiver.settimeout(1)
+        receiver.send(json.dumps({'capture': POINT}).encode())
+        with patch('orbis_sentinel.observer.ObserverClient', Client), \
+                patch('orbis_sentinel.observer.time.monotonic', side_effect=[100, 100, 120, 120, 121]), \
+                patch('orbis_sentinel.observer.time.sleep'), self.assertRaises(Finished):
+            _observer_worker(output, ('/run/orbis-observer/progress.sock',), 1)
+        first = json.loads(receiver.recv(65536))
+        second = json.loads(receiver.recv(65536))
+        self.assertEqual(first['sample']['capture'], capture())
+        self.assertIsNone(second['sample']['capture'])
+        self.assertEqual(calls, [('capture', POINT, 102), ('update', 102), ('update', 122)])
+        self.assertEqual(output.fileno(), -1)
+
+    def test_capture_cache_never_leaks_a_stale_or_different_point(self):
+        collector = ObserverCollector("/run/orbis-observer/progress.sock")
+        self.addCleanup(collector.close)
+        for state, sample in (("ready", capture()), ("stale", capture()), ("unavailable", capture()),
+                              ("ready", {**capture(), "id": "00000000-0000-4000-8000-000000000000"}),
+                              ("ready", {**capture(), "private": "hidden"}), ("ready", None)):
+            with self.subTest(state=state, sample=sample):
+                value = {"state": state, "ageMs": 123, "sample": {"capture": sample}}
+                with patch("orbis_sentinel.observer.TelemetryCollector.snapshot", return_value=value):
+                    result = collector.capture_snapshot(POINT)
+                expected = state == "ready" and sample == capture()
+                self.assertEqual(result["available"], expected)
+                self.assertEqual(result["progress"], capture() if expected else None)
+
     def test_failed_stale_or_disabled_observations_never_retain_success(self):
         collector = ObserverCollector("/run/orbis-observer/progress.sock")
         self.addCleanup(collector.close)

@@ -71,6 +71,20 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(json.loads(body), {"ok": True})
         self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o600)
 
+    def test_capture_route_is_explicit_read_only_and_cache_only(self):
+        point = "12345678-1234-4123-8123-123456789abc"
+        calls = []
+        self.start(capture_provider=lambda value: calls.append(value) or {"available": False})
+        route = "/sentinel/api/v1/captures/" + point + "/progress"
+        result = self.request(("GET " + route + " HTTP/1.1\r\n\r\n").encode())
+        self.assertIn(b"200 OK", result)
+        self.assertEqual(json.loads(result.split(b"\r\n\r\n")[1]), {"available": False})
+        self.assertEqual(calls, [point])
+        for bad in (route + "?x=1", route + "/", route.replace(point, "../" + point)):
+            self.assertIn(b"404", self.request(("GET " + bad + " HTTP/1.1\r\n\r\n").encode()))
+        self.assertIn(b"405", self.request(("POST " + route + " HTTP/1.1\r\n\r\n").encode()))
+        self.assertEqual(calls, [point])
+
     def test_rejections(self):
         calls = []
         self.start({ROUTE: lambda: calls.append(1)})

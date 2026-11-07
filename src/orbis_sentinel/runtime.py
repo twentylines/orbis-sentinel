@@ -63,7 +63,8 @@ def main(argv=None):
                 "schema": "orbis-sentinel.progress.v1", "available": False,
                 "progress": None, "ageMs": None, "sourceState": "unavailable"},
         }
-        server = SentinelServer(listener.getsockname() if listener else args.socket, providers, listener=listener)
+        server = SentinelServer(listener.getsockname() if listener else args.socket, providers, listener=listener,
+            capture_provider=observer.capture_snapshot if observer else None)
         for signum in (signal.SIGTERM, signal.SIGINT):
             original[signum] = signal.signal(signum, lambda *_: stop.set())
         collector.start()

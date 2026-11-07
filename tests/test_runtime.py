@@ -51,9 +51,11 @@ class RuntimeLinuxTests(unittest.TestCase):
                     process.kill()
                     process.wait(timeout=5)
 
-    def launch(self, listener=None):
+    def launch(self, listener=None, observer_path=None):
         if listener is None:
             args = [sys.executable, "-I", str(self.launcher), "--socket", self.path]
+            if observer_path is not None:
+                args.extend(["--observer-socket", observer_path])
             process = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         else:
             code = ("import os,sys; fd=int(sys.argv[1]); os.dup2(fd,3); os.set_inheritable(3,True); "
@@ -124,6 +126,19 @@ class RuntimeLinuxTests(unittest.TestCase):
             self.assertEqual(self.ready(second)["state"], "ready")
             self.stop(second)
             self.assertEqual(os.lstat(self.path).st_ino, identity)
+
+    def test_capture_api_remains_responsive_without_orbis_or_host_observer(self):
+        process = self.launch(observer_path="/run/orbis-observer/progress.sock")
+        self.ready(process)
+        point = "12345678-1234-4123-8123-123456789abc"
+        for _ in range(4):
+            result = self.request("captures/" + point + "/progress")
+            self.assertEqual(result["schema"], "orbis-sentinel.capture-progress.v1")
+            self.assertEqual(result["id"], point)
+            self.assertFalse(result["available"])
+            self.assertIsNone(result["progress"])
+            self.assertEqual(self.request()["state"], "ready")
+        self.stop(process)
 
     def test_health_api_remains_ready_when_worker_stalls(self):
         collector = TelemetryCollector(interval=0.1, max_age=0.3, worker=_blocked_worker)
