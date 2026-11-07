@@ -16,6 +16,7 @@ import threading
 import time
 
 from .contracts import API_PREFIX
+from .capture_page import PageAsset, page_asset, capability as page_capability, CSP
 
 _ROUTES = frozenset(API_PREFIX + "/" + name for name in ("health", "status", "telemetry", "progress"))
 _TOKEN = re.compile(rb"[!#$%&'*+.^_`|~0-9A-Za-z-]+\Z")
@@ -149,8 +150,12 @@ class SentinelServer:
     def _handle(self, conn, deadline):
         try:
             status, body = self._request(conn, deadline)
-            response = (f"HTTP/1.1 {status}\r\nContent-Type: application/json\r\n"
+            content_type = 'application/json'
+            if isinstance(body, PageAsset):
+                body, content_type = body
+            response = (f"HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\n"
                         f"Content-Length: {len(body)}\r\nCache-Control: no-store\r\n"
+                        f"Content-Security-Policy: {CSP}\r\nReferrer-Policy: no-referrer\r\n"
                         "X-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n").encode("ascii") + body
             remaining = deadline - time.monotonic()
             if remaining > 0:
@@ -204,6 +209,15 @@ class SentinelServer:
         except UnicodeDecodeError:
             return error("400 Bad Request")
         capture = _CAPTURE_ROUTE.fullmatch(path) if self.capture_provider is not None else None
+        if self.capture_provider is not None:
+            try:
+                asset = page_asset(path)
+                if asset is not None:
+                    return '200 OK', asset
+                if path == API_PREFIX + '/capture-ui':
+                    return '200 OK', json.dumps(page_capability(), separators=(',', ':')).encode('ascii')
+            except (OSError, ValueError):
+                return error('503 Service Unavailable')
         if path not in self.providers and capture is None:
             return error("404 Not Found")
         try:

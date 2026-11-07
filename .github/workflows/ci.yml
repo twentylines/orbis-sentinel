@@ -9,6 +9,15 @@ permissions:
   contents: read
 
 jobs:
+  capture-page:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22.23.4'
+      - name: Test capture page
+        run: node --test tests/test_capture_page.mjs
   tests:
     strategy:
       fail-fast: false

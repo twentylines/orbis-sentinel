@@ -1,0 +1,286 @@
+:root {
+  color-scheme: dark;
+  font-family: system-ui, sans-serif;
+  color: #e5eded;
+  background: #080e13;
+  --accent: #a6c7bd;
+}
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+  overflow-x: hidden;
+}
+main {
+  isolation: isolate;
+  min-height: 100vh;
+  display: grid;
+  grid-template-rows: 1fr auto;
+  place-items: center;
+  padding: clamp(16px, 4vw, 64px);
+  position: relative;
+}
+@supports (min-height: 100svh) {
+  main {
+    min-height: 100svh;
+  }
+}
+.space {
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  overflow: hidden;
+  pointer-events: none;
+  background:
+    radial-gradient(ellipse at 10% 85%, #30444870, transparent 55%), radial-gradient(ellipse at 90% 20%, #59666b33, transparent 60%),
+    linear-gradient(125deg, #080e13, #162026 55%, #080e13);
+}
+.stars {
+  position: absolute;
+  inset: -10%;
+  opacity: 0.12;
+  background:
+    radial-gradient(1px 1px at 10% 20%, #e3efef 99%, transparent), radial-gradient(1px 1px at 70% 18%, #e3efef 99%, transparent),
+    radial-gradient(1px 1px at 37% 61%, #e3efef 99%, transparent), radial-gradient(1px 1px at 83% 76%, #e3efef 99%, transparent),
+    radial-gradient(1px 1px at 20% 87%, #e3efef 99%, transparent);
+  background-size: 380px 310px;
+}
+.travel {
+  position: absolute;
+  inset: -40%;
+  opacity: 0;
+  background: repeating-conic-gradient(from 20deg at 50% 50%, transparent 0 29.9deg, #adc4c415 29.9deg 30deg);
+  mask-image: radial-gradient(ellipse, transparent 12%, #000 70%, transparent);
+  animation: travel-in 4.8s cubic-bezier(0.22, 0.72, 0.18, 1) 1 both;
+}
+.capture {
+  width: min(100%, 42rem);
+  text-align: center;
+  padding: 32px 0;
+  animation: capture-enter 0.76s cubic-bezier(0.22, 0.72, 0.18, 1) both;
+}
+h1 {
+  font-size: clamp(1.65rem, 5vw, 3.5rem);
+  line-height: 1.18;
+  letter-spacing: -0.025em;
+  margin: 32px 0 16px;
+  text-wrap: balance;
+}
+.stage {
+  min-height: 3.2em;
+  font-size: clamp(1.1rem, 2.4vw, 1.4rem);
+  line-height: 1.6;
+  margin: 0;
+  text-wrap: balance;
+}
+.notice,
+footer {
+  color: #c1cece;
+  font-size: 0.95rem;
+  line-height: 1.6;
+}
+.notice {
+  margin: 24px 0 0;
+}
+footer {
+  padding: 24px 0 4px;
+}
+.capture-scene {
+  height: 144px;
+  position: relative;
+  display: grid;
+  place-items: center;
+  perspective: 800px;
+}
+.capture-deck {
+  position: relative;
+  width: min(176px, 60vw);
+  height: min(112px, 44vw);
+  transform-style: preserve-3d;
+  transform: rotateX(14deg) rotateY(-12deg);
+  transition:
+    transform 0.52s cubic-bezier(0.22, 0.72, 0.18, 1),
+    opacity 0.52s;
+}
+.capture-deck i {
+  position: absolute;
+  inset: 0;
+  border: 1px solid #a6c7bd70;
+  border-radius: 0.6rem;
+  background: linear-gradient(140deg, #44625e60, #18282d);
+  box-shadow: 0 14px 40px #0003;
+  transition: transform 0.52s cubic-bezier(0.22, 0.72, 0.18, 1);
+}
+.capture-deck i:nth-child(1) {
+  transform: translate3d(-17.6px, -16px, -45px);
+}
+.capture-deck i:nth-child(2) {
+  transform: translate3d(-8.8px, -8px, -22px);
+}
+.capture-deck i:nth-child(3)::after {
+  content: "";
+  position: absolute;
+  inset: 20% 15%;
+  border-block: 1px solid #a6c7bd60;
+}
+[data-phase="saving-orbis"] .capture-deck,
+[data-phase="saving-apps"] .capture-deck {
+  transform: rotateX(8deg) rotateY(12deg);
+}
+[data-phase="sealing"] .capture-deck i:nth-child(1),
+[data-phase="sealing"] .capture-deck i:nth-child(2) {
+  transform: translate3d(0, 0, -1px);
+}
+.capture-progress {
+  min-height: 3rem;
+  margin: 16px auto 0;
+  width: min(100%, 31rem);
+}
+progress,
+.scan {
+  width: 100%;
+  height: 0.5rem;
+  border: 0;
+  border-radius: 1rem;
+  overflow: hidden;
+  background: #c1d0d01a;
+}
+progress {
+  appearance: none;
+  display: block;
+  accent-color: var(--accent);
+}
+progress::-webkit-progress-bar {
+  background: #c1d0d01a;
+  border-radius: 1rem;
+}
+progress::-webkit-progress-value {
+  background: var(--accent);
+  border-radius: 1rem;
+}
+progress::-moz-progress-bar {
+  background: var(--accent);
+  border-radius: 1rem;
+}
+.scan::after {
+  content: "";
+  display: block;
+  width: 35%;
+  height: 100%;
+  background: linear-gradient(90deg, transparent, var(--accent), transparent);
+  transform: translateX(-100%);
+  animation: scan 2.6s ease-in-out infinite;
+}
+.counts {
+  margin: 0.75rem 0 0;
+  color: #c1cece;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.6;
+}
+.boot-lights {
+  display: none;
+  position: absolute;
+  width: 160px;
+  height: 28px;
+}
+.boot-lights i {
+  position: absolute;
+  top: 9px;
+  left: calc(50% - 5px);
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 9px var(--accent);
+  animation: boot-sweep 2600ms cubic-bezier(0.25, 0.2, 0.3, 1) infinite;
+}
+.boot-lights i::before {
+  position: absolute;
+  content: "";
+  top: 4px;
+  right: 4px;
+  width: 52px;
+  height: 2px;
+  background: linear-gradient(to right, transparent, var(--accent));
+  filter: blur(1.5px);
+  opacity: 0.65;
+}
+[data-mode="boot"] .capture-deck {
+  opacity: 0;
+  transform: scale(0.7);
+}
+[data-mode="boot"] .boot-lights {
+  display: block;
+}
+[data-mode="boot"] .notice {
+  visibility: hidden;
+}
+[data-mode="failed"] .capture-deck {
+  opacity: 0.6;
+}
+[hidden] {
+  /* biome-ignore lint/complexity/noImportantStyles: hidden must override stage-specific display rules. */
+  display: none !important;
+}
+html[data-paused] *,
+html[data-paused] *::after {
+  /* biome-ignore lint/complexity/noImportantStyles: every animation must pause when the document is hidden. */
+  animation-play-state: paused !important;
+}
+@keyframes scan {
+  to {
+    transform: translateX(390%);
+  }
+}
+@keyframes boot-sweep {
+  0% {
+    transform: translateX(-64px) scale(0.65);
+    opacity: 0;
+  }
+  18% {
+    opacity: 0.85;
+  }
+  75% {
+    opacity: 0.65;
+  }
+  100% {
+    transform: translateX(64px) scale(0.8);
+    opacity: 0;
+  }
+}
+@keyframes capture-enter {
+  from {
+    opacity: 0;
+    transform: translateY(18px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+@keyframes travel-in {
+  0% {
+    opacity: 0;
+    transform: scale(0.8);
+  }
+  30% {
+    opacity: 0.8;
+  }
+  100% {
+    opacity: 0;
+    transform: scale(1.4);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::after {
+    /* biome-ignore lint/complexity/noImportantStyles: the user motion preference overrides all stage animations. */
+    animation: none !important;
+    /* biome-ignore lint/complexity/noImportantStyles: the user motion preference overrides all stage transitions. */
+    transition: none !important;
+  }
+  .scan::after {
+    transform: translateX(100%);
+  }
+}

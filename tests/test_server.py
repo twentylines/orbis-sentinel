@@ -85,6 +85,31 @@ class ServerTests(unittest.TestCase):
         self.assertIn(b"405", self.request(("POST " + route + " HTTP/1.1\r\n\r\n").encode()))
         self.assertEqual(calls, [point])
 
+    def test_capture_page_and_fixed_assets_need_no_orbis_or_progress_call(self):
+        provider = mock.Mock(side_effect=AssertionError('page must not wait for an observation'))
+        self.start(capture_provider=provider)
+        route = '/sentinel/captures/12345678-1234-4123-8123-123456789abc'
+        response = self.request(('GET ' + route + ' HTTP/1.1\r\n\r\n').encode())
+        header, body = response.split(b'\r\n\r\n', 1)
+        self.assertIn(b'200 OK', header)
+        self.assertIn(b'text/html; charset=utf-8', header)
+        self.assertIn(b"frame-ancestors 'none'", header)
+        self.assertIn(b'Capturing Orbis', body)
+        self.assertNotIn(b'<button', body)
+        self.assertNotIn(b'Open server', body)
+        for name, content_type in [('capture.css', b'text/css'), ('capture.js', b'text/javascript')]:
+            response = self.request(('GET /sentinel/capture-assets/' + name + ' HTTP/1.1\r\n\r\n').encode())
+            self.assertIn(b'200 OK', response)
+            self.assertIn(content_type, response.split(b'\r\n\r\n', 1)[0])
+        cap = self.request(b'GET /sentinel/api/v1/capture-ui HTTP/1.1\r\n\r\n')
+        value = json.loads(cap.split(b'\r\n\r\n', 1)[1])
+        self.assertEqual(value['schema'], 'orbis-sentinel.capture-ui.v1')
+        self.assertFalse(value['mutations'])
+        self.assertEqual(set(value['assets']), {'capture.html', 'capture.css', 'capture.js'})
+        for invalid in (route + '?x=1', route + '/', '/sentinel/capture-assets/../capture.html', '/sentinel/capture-assets/capture.py'):
+            self.assertIn(b'404', self.request(('GET ' + invalid + ' HTTP/1.1\r\n\r\n').encode()))
+        provider.assert_not_called()
+
     def test_rejections(self):
         calls = []
         self.start({ROUTE: lambda: calls.append(1)})

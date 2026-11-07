@@ -138,6 +138,18 @@ class RuntimeLinuxTests(unittest.TestCase):
             self.assertFalse(result["available"])
             self.assertIsNone(result["progress"])
             self.assertEqual(self.request()["state"], "ready")
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.settimeout(2)
+            connection.connect(self.path)
+            connection.sendall(("GET /sentinel/captures/" + point + " HTTP/1.1\r\nHost: sentinel\r\n\r\n").encode())
+            response = b""
+            while chunk := connection.recv(65536):
+                response += chunk
+        head, body = response.split(b"\r\n\r\n", 1)
+        self.assertIn(b"200 OK", head)
+        self.assertIn(b"text/html", head)
+        self.assertIn(b"Capturing Orbis", body)
+        self.assertIn(b"/sentinel/capture-assets/capture.js", body)
         self.stop(process)
 
     def test_health_api_remains_ready_when_worker_stalls(self):
