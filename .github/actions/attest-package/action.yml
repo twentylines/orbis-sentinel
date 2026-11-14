@@ -1,0 +1,34 @@
+name: Attest Sentinel package
+description: Run the pinned signer with temporary files confined to the package workspace.
+
+inputs:
+  subject-name:
+    description: Qualified archive filename.
+    required: true
+  subject-digest:
+    description: Digest produced by package qualification.
+    required: true
+  github-token:
+    description: Token used to publish the attestation.
+    default: ${{ github.token }}
+  push-to-registry:
+    description: Container registry publication is disabled for source archives.
+    default: 'false'
+  create-storage-record:
+    description: OCI storage records are not used for source archives.
+    default: 'false'
+  show-summary:
+    description: Include the attestation link in the workflow summary.
+    default: 'true'
+
+outputs:
+  bundle-path:
+    description: Signed bundle produced inside the package workspace.
+  attestation-id:
+    description: Published attestation identifier.
+  attestation-url:
+    description: Published attestation link.
+
+runs:
+  using: node24
+  main: index.mjs

@@ -33,47 +33,51 @@ jobs:
       - name: Prepare package workspace
         shell: bash
         run: |
-          mkdir -m 700 .sentinel-work
-          mkdir -m 700 .sentinel-work/tmp
+          mkdir -m 700 sentinel-package-work
+          mkdir -m 700 sentinel-package-work/tmp
       - name: Test
         env:
-          TMPDIR: ${{ github.workspace }}/.sentinel-work/tmp
+          TMPDIR: ${{ github.workspace }}/sentinel-package-work/tmp
         run: |
           python -m unittest discover -s tests -v
-          node --test tests/test_capture_page.mjs
+          node --test tests/test_capture_page.mjs tests/test_attest_package.mjs
       - name: Build and qualify package
         id: package
         env:
-          TMPDIR: ${{ github.workspace }}/.sentinel-work/tmp
+          TMPDIR: ${{ github.workspace }}/sentinel-package-work/tmp
         shell: bash
         run: |
-          python packaging/qualify_release.py --output .sentinel-work/package > .sentinel-work/result.json
+          python packaging/qualify_release.py --output sentinel-package-work/package > sentinel-package-work/result.json
           python - <<'PY'
           import json, os
           from pathlib import Path
-          result = json.loads(Path('.sentinel-work/result.json').read_text())
+          result = json.loads(Path('sentinel-package-work/result.json').read_text())
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
               for key in ('artifact', 'checksum', 'filename', 'sha256'):
                   output.write(f'{key}={result[key]}\n')
           PY
-      - name: Check attestation paths
+      - name: Fetch pinned signing code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: actions/attest
+          ref: 1e69f48acb82d1966a394da916b4c1698aa569d6
+          path: sentinel-package-work/tools/attest
+          persist-credentials: false
+      - name: Check package temporary directory
         env:
-          TMPDIR: ${{ github.workspace }}/.sentinel-work/tmp
-          RUNNER_TEMP: ${{ github.workspace }}/.sentinel-work/tmp
+          TMPDIR: ${{ github.workspace }}/sentinel-package-work/tmp
         run: |
           python - <<'PY'
           import os
           from pathlib import Path
           root = Path(os.environ['GITHUB_WORKSPACE']).resolve()
-          for key in ('TMPDIR', 'RUNNER_TEMP'):
-              path = Path(os.environ[key]).resolve(strict=True)
-              assert path.is_relative_to(root)
+          path = Path(os.environ['TMPDIR']).resolve(strict=True)
+          assert path.is_relative_to(root)
           PY
       - name: Attest qualified archive
-        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        uses: ./.github/actions/attest-package
         env:
-          TMPDIR: ${{ github.workspace }}/.sentinel-work/tmp
-          RUNNER_TEMP: ${{ github.workspace }}/.sentinel-work/tmp
+          TMPDIR: ${{ github.workspace }}/sentinel-package-work/tmp
         with:
           subject-name: ${{ steps.package.outputs.filename }}
           subject-digest: sha256:${{ steps.package.outputs.sha256 }}
