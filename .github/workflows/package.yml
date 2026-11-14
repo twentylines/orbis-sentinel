@@ -1,0 +1,89 @@
+name: Sentinel package
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    if: github.repository == 'twentylines/orbis-sentinel' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+      PYTHONPATH: src
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.10'
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22.23.4'
+      - name: Prepare package workspace
+        shell: bash
+        run: |
+          mkdir -m 700 .sentinel-work
+          mkdir -m 700 .sentinel-work/tmp
+      - name: Test
+        env:
+          TMPDIR: ${{ github.workspace }}/.sentinel-work/tmp
+        run: |
+          python -m unittest discover -s tests -v
+          node --test tests/test_capture_page.mjs
+      - name: Build and qualify package
+        id: package
+        env:
+          TMPDIR: ${{ github.workspace }}/.sentinel-work/tmp
+        shell: bash
+        run: |
+          python packaging/qualify_release.py --output .sentinel-work/package > .sentinel-work/result.json
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          result = json.loads(Path('.sentinel-work/result.json').read_text())
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              for key in ('artifact', 'checksum', 'filename', 'sha256'):
+                  output.write(f'{key}={result[key]}\n')
+          PY
+      - name: Check attestation paths
+        env:
+          TMPDIR: ${{ github.workspace }}/.sentinel-work/tmp
+          RUNNER_TEMP: ${{ github.workspace }}/.sentinel-work/tmp
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          root = Path(os.environ['GITHUB_WORKSPACE']).resolve()
+          for key in ('TMPDIR', 'RUNNER_TEMP'):
+              path = Path(os.environ[key]).resolve(strict=True)
+              assert path.is_relative_to(root)
+          PY
+      - name: Attest qualified archive
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        env:
+          TMPDIR: ${{ github.workspace }}/.sentinel-work/tmp
+          RUNNER_TEMP: ${{ github.workspace }}/.sentinel-work/tmp
+        with:
+          subject-name: ${{ steps.package.outputs.filename }}
+          subject-digest: sha256:${{ steps.package.outputs.sha256 }}
+      - name: Upload qualified archive and checksum
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sentinel-package-${{ github.sha }}
+          path: |
+            ${{ steps.package.outputs.artifact }}
+            ${{ steps.package.outputs.checksum }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
