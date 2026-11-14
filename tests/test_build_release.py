@@ -57,6 +57,19 @@ class ReleaseTests(unittest.TestCase):
                     self.assertEqual(manifest["files"][entry.name], {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()})
             self.assertIn("packaging/systemd/orbis-sentinel.service.d/observer.conf", archive.getnames())
 
+    def test_archive_is_stable_when_python_changes_its_compression_default(self):
+        first = release.build_release(self.source, self.root / "one")
+        original = release.gzip.GzipFile
+
+        def changed_default(*args, **kwargs):
+            kwargs.setdefault("compresslevel", 1)
+            return original(*args, **kwargs)
+
+        with mock.patch.object(release.gzip, "GzipFile", changed_default):
+            second = release.build_release(self.source, self.root / "two")
+        self.assertEqual(Path(first["artifact"]).read_bytes(), Path(second["artifact"]).read_bytes())
+        self.assertEqual(first["sha256"], second["sha256"])
+
     def test_extraction_preserves_public_directory_access_under_private_umask(self):
         result = release.build_release(self.source, self.root / "out")
         destination = self.root / "installed"

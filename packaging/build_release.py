@@ -117,7 +117,7 @@ def build_release(source: Path, output: Path) -> dict[str, object]:
         raise FileExistsError("Release output already exists")
     with tempfile.TemporaryDirectory(prefix=".sentinel-release-", dir=output) as temporary:
         staged = Path(temporary) / "release.tar.gz"
-        with staged.open("wb") as raw, gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as compressed:
+        with staged.open("wb") as raw, gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0, compresslevel=6) as compressed:
             with tarfile.open(fileobj=compressed, mode="w|", format=tarfile.USTAR_FORMAT) as archive:
                 directories = {parent.as_posix() for name in payload for parent in Path(name).parents if parent != Path(".")}
                 for name in sorted(directories, key=lambda value: (value.count("/"), value)):
