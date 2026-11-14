@@ -22,6 +22,22 @@ Four read-only GET endpoints are available under `/sentinel/api/v1`: `health`, `
 
 The optional `--observer-socket` connects to an enrolled, read-only host progress socket. Sentinel verifies its root owner, group, permissions, inode identity, connected server credentials and protocol capability. It reports the protected update's actual phase and download byte counts. Missing, invalid or expired observations become unavailable; progress never authorizes a recovery action or establishes that routing can return to Orbis.
 
+## Release staging
+
+`packaging/build_release.py` creates a reproducible source archive and checksum. The installer-side `packaging/stage_release.py` verifies a local archive against an already-approved checksum and component version, checks its complete manifest, and prepares an immutable version directory. It rejects links, unexpected files, unsafe permissions and replacement of an existing version.
+
+Create a trusted releases directory first. System installations use root ownership and mode `0755`. Supply the expected checksum from approved release metadata:
+
+```sh
+python3 packaging/stage_release.py \
+  --artifact orbis-sentinel-0.1.0-dev.10.tar.gz \
+  --sha256 "$RELEASE_SHA256" \
+  --version 0.1.0-dev.10 \
+  --releases /opt/orbis-sentinel/releases
+```
+
+The tool checks the written files before publication and returns the prepared directory with `activated: false`. It leaves `current`, service units and running jobs unchanged. The checksum establishes byte integrity; publisher authentication remains the installer's responsibility. Automatic installer/OTA wiring and supervisor-authorized activation are still pending. Unexpected prepared-tree changes or a destination-parent change after publication require review of the retained directory before retrying.
+
 ## systemd
 
 The units in `packaging/systemd` run the local service as an unprivileged dynamic user and retain a root-only socket across service restarts. They expect the source bundle at `/opt/orbis-sentinel/current`. Install both unit files under `/etc/systemd/system`, then enable both `orbis-sentinel.socket` and `orbis-sentinel.service` to keep the service running after boot. The systemd-created socket directory uses mode `0755`; this differs from the private directory required by standalone mode because systemd owns the socket and passes its listening descriptor to the service.
