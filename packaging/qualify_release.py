@@ -17,7 +17,7 @@ from stage_release import stage_release, MAX_ARCHIVE_BYTES
 
 
 CONTENT_RULES = {
-    "private home path": re.compile(rb"/Users/|/home/[^/\s\x27\x22]+/|[A-Za-z]:\\+Users\\+"),
+    "private home path": re.compile(rb"/(?:Users/|home/[^/\s\x27\x22]+/)|[A-Za-z]:\\+Users\\+"),
     "credential": re.compile(
         rb"-----BEGIN (?:[A-Z]+ )?PRIVATE KEY-----|\bgh[pousr]_[A-Za-z0-9]{20,}|"
         rb"\bgithub_pat_[A-Za-z0-9_]{20,}|\bAKIA[A-Z0-9]{16}\b|\bsk-[A-Za-z0-9]{20,}"

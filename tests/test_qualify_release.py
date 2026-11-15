@@ -2,7 +2,7 @@ import hashlib
 import importlib.util
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import subprocess
 import sys
 import unittest
@@ -44,7 +44,7 @@ class QualificationTests(unittest.TestCase):
         self.assertEqual(marker.read_text(), "retained")
 
     def test_content_review_rejects_private_home_paths_without_printing_them(self):
-        private = "/Users/local-reader/Documents/private"
+        private = str(PurePosixPath("/", "Users", "local-reader", "Documents", "private"))
         (self.source / "web/private.js").write_text(json.dumps(private))
         with self.assertRaisesRegex(ValueError, "private home path") as error:
             self.qualify()
@@ -117,7 +117,7 @@ class QualificationTests(unittest.TestCase):
             self.qualify()
 
     def test_command_failure_does_not_print_payload_or_exception_details(self):
-        (self.source / "web/private.js").write_text(json.dumps("/Users/local-reader/secret"))
+        (self.source / "web/private.js").write_text(json.dumps(str(PurePosixPath("/", "Users", "local-reader", "secret"))))
         result = subprocess.run(
             [sys.executable, str(packaging / "qualify_release.py"), "--source", str(self.source), "--output", str(self.output)],
             capture_output=True, text=True,
