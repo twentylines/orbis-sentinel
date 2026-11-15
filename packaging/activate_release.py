@@ -146,6 +146,18 @@ def _encoded(value):
     return (json.dumps(value, sort_keys=True, separators=(',', ':')) + '\n').encode()
 
 
+def _version_order(version):
+    core, separator, suffix = version.partition('-')
+    numbers = core.split('.')
+    identifiers = suffix.split('.') if separator else []
+    if (len(numbers) != 3 or any(not number.isascii() or not number.isdecimal()
+            or str(int(number)) != number for number in numbers)
+            or any(not item or (item.isdecimal() and str(int(item)) != item) for item in identifiers)):
+        raise ActivationError('Sentinel version precedence requires a canonical version')
+    prerelease = tuple((0, int(item)) if item.isdecimal() else (1, item) for item in identifiers)
+    return (*map(int, numbers), not separator, prerelease)
+
+
 def _inventory(directory, version):
     parent = _Parent(directory)
     initializer = None
@@ -374,6 +386,7 @@ def activate_release(artifact, bundle, workspace, *, sha256, version, source_com
             or not isinstance(sha256, str) or not SHA256.fullmatch(sha256)
             or not isinstance(source_commit, str) or not COMMIT.fullmatch(source_commit)):
         raise ActivationError('A reviewed Sentinel version, checksum and full source revision are required')
+    candidate_order = _version_order(version)
     _directory(ROOT, 0o755)
     _directory(ROOT / 'releases', 0o755)
     _directory(STATE, 0o700)
@@ -399,6 +412,8 @@ def activate_release(artifact, bundle, workspace, *, sha256, version, source_com
                 raise RecoveryRequired('An interrupted Sentinel activation requires independent reconciliation')
         installed_bytes = _read(state, 'installed.json', 0o600)
         installed = _receipt(_json(installed_bytes)) if installed_bytes is not None else None
+        if installed is not None and candidate_order < _version_order(installed['version']):
+            raise ActivationError('The installed Sentinel is newer than the candidate; no downgrade was made')
         if prior is not None:
             if (set(prior) != {'schema', 'id', 'phase', 'candidate', 'previous', 'previousUnits'}
                     or not isinstance(prior['id'], str) or len(prior['id']) != 32

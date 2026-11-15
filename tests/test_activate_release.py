@@ -24,6 +24,13 @@ with mock.patch.object(sys, 'path', [str(PACKAGING), *sys.path]):
 
 
 class ActivationCliTests(unittest.TestCase):
+    def test_version_precedence_handles_numeric_prerelease_and_stable_versions(self):
+        versions = ['0.1.0-alpha', '0.1.0-alpha.1', '0.1.0-dev.2', '0.1.0-dev.10', '0.1.0', '0.1.1', '1.0.0']
+        self.assertEqual(sorted(reversed(versions), key=activate._version_order), versions)
+        for version in ('00.1.0', '0.01.0', '0.1.0-dev.01', '0.1', '0.1.0-'):
+            with self.subTest(version=version), self.assertRaises(activate.ActivationError):
+                activate._version_order(version)
+
     def test_isolated_cli_loads_only_its_sibling_modules(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -176,6 +183,19 @@ class ActivationTests(unittest.TestCase):
         self.assertTrue((self.install / 'releases' / newer['version']).is_dir())
         self.assertTrue(all(self.systemd.active.values()))
         self.assertEqual(self.journal()['phase'], 'rolled-back')
+
+    def test_older_candidate_is_refused_before_publisher_or_supervisor_actions(self):
+        self.run_activation()
+        self.run_activation(self.build('0.1.0-dev.11'))
+        before = {name: (self.state / name).read_bytes() for name in ('installed.json', 'activation.json')}
+        self.systemd.events.clear()
+        with mock.patch.object(activate, 'verify_release') as verifier:
+            with self.assertRaisesRegex(activate.ActivationError, 'no downgrade was made'):
+                self.run_activation(self.package)
+            verifier.assert_not_called()
+        self.assertEqual(self.systemd.events, [])
+        self.assertEqual((self.install / 'current').readlink().as_posix(), 'releases/0.1.0-dev.11')
+        self.assertEqual({name: (self.state / name).read_bytes() for name in before}, before)
 
     def test_failed_first_install_removes_only_its_owned_units_and_allows_authenticated_retry(self):
         self.systemd.fail_restart = True

@@ -133,10 +133,23 @@ def main():
     subprocess.run([sys.executable, '-I', '-B', str(old_directory / 'bin/orbis-sentinel-capture'), '--help'],
                    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=10,
                    env={'PATH': os.defpath, 'TMPDIR': str(BASE / 'tmp'), 'PYTHONDONTWRITEBYTECODE': '1'})
+    before = {name: (activation.STATE / name).read_bytes() for name in ('installed.json', 'activation.json')}
+    service = systemd.inspect('orbis-sentinel.service')
+    try:
+        activation.activate_release(**options(old, 'verify-downgrade'))
+    except activation.ActivationError as error:
+        assert type(error) is activation.ActivationError and 'no downgrade was made' in str(error)
+    else:
+        raise AssertionError('An older installer must not downgrade the installed component')
+    assert not (BASE / 'verify-downgrade').exists()
+    assert {name: (activation.STATE / name).read_bytes() for name in before} == before
+    observed = systemd.inspect('orbis-sentinel.service')
+    assert all(observed[key] == service[key] for key in ('MainPID', 'InvocationID', 'ControlGroup'))
+    activation._ready(systemd, new['version'])
     systemd.stop()
     print(json.dumps({'schema': 'orbis-sentinel.systemd-qualification.v1', 'passed': True,
         'cases': ['signed-first-install', 'fault-injected-health-rollback', 'signed-older-to-current-retry',
-                  'retained-old-runtime', 'independent-unprivileged-service', 'supervisor-stop'],
+                  'retained-old-runtime', 'independent-unprivileged-service', 'older-installer-downgrade-refusal', 'supervisor-stop'],
         'oldVersion': old['version'], 'newVersion': new['version'],
         'publisherVerification': 'real', 'systemd': 'real', 'healthFaultOnly': 'explicit injection',
         'retainedOldFiles': len(old_files)}, sort_keys=True))
