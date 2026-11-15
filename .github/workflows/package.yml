@@ -53,7 +53,7 @@ jobs:
           from pathlib import Path
           result = json.loads(Path('sentinel-package-work/result.json').read_text())
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
-              for key in ('artifact', 'checksum', 'filename', 'sha256'):
+              for key in ('artifact', 'checksum', 'filename', 'sha256', 'version'):
                   output.write(f'{key}={result[key]}\n')
           PY
       - name: Fetch pinned signing code
@@ -75,12 +75,39 @@ jobs:
           assert path.is_relative_to(root)
           PY
       - name: Attest qualified archive
+        id: attestation
         uses: ./.github/actions/attest-package
         env:
           TMPDIR: ${{ github.workspace }}/sentinel-package-work/tmp
         with:
           subject-name: ${{ steps.package.outputs.filename }}
           subject-digest: sha256:${{ steps.package.outputs.sha256 }}
+      - name: Verify signed publisher before artifact upload
+        env:
+          TMPDIR: ${{ github.workspace }}/sentinel-package-work/tmp
+          ARTIFACT: ${{ steps.package.outputs.artifact }}
+          SIGNED_BUNDLE: ${{ steps.attestation.outputs.bundle-path }}
+          RELEASE_SHA256: ${{ steps.package.outputs.sha256 }}
+          RELEASE_VERSION: ${{ steps.package.outputs.version }}
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          root = Path(os.environ['GITHUB_WORKSPACE']).resolve(strict=True)
+          bundle = Path(os.environ['SIGNED_BUNDLE']).resolve(strict=True)
+          assert bundle.is_relative_to(root), 'Signing bundle must remain inside the workspace'
+          PY
+          mkdir -m 755 sentinel-package-work/publisher-staged
+          python packaging/verify_release.py \
+            --artifact "$ARTIFACT" \
+            --bundle "$SIGNED_BUNDLE" \
+            --releases "$GITHUB_WORKSPACE/sentinel-package-work/publisher-staged" \
+            --workspace "$GITHUB_WORKSPACE/sentinel-package-work/publisher-verification" \
+            --sha256 "$RELEASE_SHA256" \
+            --version "$RELEASE_VERSION" \
+            --source-commit "$GITHUB_SHA" \
+            --verifier "$(command -v gh)"
       - name: Upload qualified archive and checksum
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
