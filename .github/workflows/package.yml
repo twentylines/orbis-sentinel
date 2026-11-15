@@ -12,6 +12,10 @@ jobs:
   package:
     if: github.repository == 'twentylines/orbis-sentinel' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.package.outputs.version }}
+      sha256: ${{ steps.package.outputs.sha256 }}
+      filename: ${{ steps.package.outputs.filename }}
     permissions:
       contents: read
       id-token: write
@@ -108,13 +112,63 @@ jobs:
             --version "$RELEASE_VERSION" \
             --source-commit "$GITHUB_SHA" \
             --verifier "$(command -v gh)"
-      - name: Upload qualified archive and checksum
+      - name: Retain the verified public provenance bundle
+        env:
+          ARTIFACT: ${{ steps.package.outputs.artifact }}
+          RELEASE_VERSION: ${{ steps.package.outputs.version }}
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          artifact = Path(os.environ['ARTIFACT'])
+          verified = Path('sentinel-package-work/publisher-verification/inputs') / ('orbis-sentinel-' + os.environ['RELEASE_VERSION'] + '.tar.gz.sigstore.json')
+          body = verified.read_bytes()
+          assert 0 < len(body) <= 4 * 1024 * 1024
+          target = artifact.with_name(artifact.name + '.sigstore.json')
+          with target.open('xb') as output:
+              output.write(body)
+          PY
+      - name: Upload qualified archive, checksum and provenance
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sentinel-package-${{ github.sha }}
           path: |
             ${{ steps.package.outputs.artifact }}
             ${{ steps.package.outputs.checksum }}
+            ${{ steps.package.outputs.artifact }}.sigstore.json
           if-no-files-found: error
           compression-level: 0
           retention-days: 30
+  native-systemd:
+    needs: package
+    if: github.repository == 'twentylines/orbis-sentinel' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Download the exact qualified package
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TMPDIR: ${{ github.workspace }}/sentinel-native-tmp
+          XDG_CACHE_HOME: ${{ github.workspace }}/sentinel-native-cache
+        run: |
+          mkdir -m 700 sentinel-native-tmp sentinel-native-cache
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --name "sentinel-package-$GITHUB_SHA" --dir "$GITHUB_WORKSPACE/sentinel-native-input"
+      - name: Qualify real installed systemd activation and rollback
+        env:
+          RELEASE_VERSION: ${{ needs.package.outputs.version }}
+          RELEASE_SHA256: ${{ needs.package.outputs.sha256 }}
+          RELEASE_FILENAME: ${{ needs.package.outputs.filename }}
+          TMPDIR: ${{ github.workspace }}/sentinel-native-tmp
+        run: |
+          sudo -n /usr/bin/python3 -I -B tests/qualify_systemd.py \
+            --source "$GITHUB_WORKSPACE" --work "$GITHUB_WORKSPACE/sentinel-native-work" \
+            --artifact "$GITHUB_WORKSPACE/sentinel-native-input/$RELEASE_FILENAME" \
+            --bundle "$GITHUB_WORKSPACE/sentinel-native-input/$RELEASE_FILENAME.sigstore.json" \
+            --sha256 "$RELEASE_SHA256" --version "$RELEASE_VERSION" --source-commit "$GITHUB_SHA"
