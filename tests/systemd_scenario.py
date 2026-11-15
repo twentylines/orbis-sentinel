@@ -53,6 +53,7 @@ def cli(record, workspace):
     result = subprocess.run(command, capture_output=True, timeout=150,
         env={'PATH': os.defpath, 'TMPDIR': str(BASE / 'tmp'), 'PYTHONDONTWRITEBYTECODE': '1'})
     if result.returncode:
+        print(result.stderr.decode(errors='replace')[-2000:], file=sys.stderr)
         # The journal is kept inside the disposable project rootfs, never uploaded.
         phase = json.loads((activation.STATE / 'activation.json').read_bytes()).get('phase') if (activation.STATE / 'activation.json').exists() else 'not-admitted'
         for command in [

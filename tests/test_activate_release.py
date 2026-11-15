@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -20,6 +21,20 @@ spec = importlib.util.spec_from_file_location('activate_release', PACKAGING / 'a
 activate = importlib.util.module_from_spec(spec)
 with mock.patch.object(sys, 'path', [str(PACKAGING), *sys.path]):
     spec.loader.exec_module(activate)
+
+
+class ActivationCliTests(unittest.TestCase):
+    def test_isolated_cli_loads_only_its_sibling_modules(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ('stage_release.py', 'verify_release.py'):
+                (root / name).write_text("raise RuntimeError('Untrusted module was imported')\n")
+            result = subprocess.run([sys.executable, '-I', '-B', str(PACKAGING / 'activate_release.py'), '--help'],
+                cwd=root, env={'PATH': os.defpath, 'PYTHONPATH': directory, 'TMPDIR': directory,
+                               'PYTHONDONTWRITEBYTECODE': '1'}, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('--source-commit', result.stdout)
+            self.assertEqual(result.stderr, '')
 
 
 class Supervisor(activate.Systemd):

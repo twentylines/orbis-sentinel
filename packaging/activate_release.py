@@ -22,6 +22,9 @@ import time
 from types import SimpleNamespace
 import uuid
 
+if __name__ == '__main__':
+    sys.path.insert(0, str(Path(__file__).resolve(strict=True).parent))
+
 from stage_release import (_Parent, _manifest, _pairs, _rename_exclusive, _verify_tree,
                            DIRECTORY_FLAGS, MAX_MANIFEST_BYTES, SHA256, VERSION)
 from verify_release import COMMIT, verify_release
