@@ -59,7 +59,7 @@ def main():
     temporary, tools = work / 'tmp', work / 'tools'
     temporary.mkdir(mode=0o700)
     tools.mkdir(mode=0o700)
-    environment = {'PATH': os.defpath, 'TMPDIR': str(temporary), 'DEBIAN_FRONTEND': 'noninteractive',
+    environment = {'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'TMPDIR': str(temporary), 'DEBIAN_FRONTEND': 'noninteractive',
                    'XDG_CACHE_HOME': str(work / 'cache'), 'XDG_CONFIG_HOME': str(work / 'config'),
                    'XDG_DATA_HOME': str(work / 'data')}
     for name in ('cache', 'config', 'data'):
