@@ -191,7 +191,7 @@ def _publisher_policy(output, filename, digest, source_commit):
 
 
 def verify_release(artifact: Path, bundle: Path, releases: Path, workspace: Path, *,
-                   sha256: str, version: str, source_commit: str, verifier: Path):
+                   sha256: str, version: str, source_commit: str, verifier: Path, reuse_existing=False):
     if (not isinstance(sha256, str) or not SHA256.fullmatch(sha256) or
             not isinstance(version, str) or len(version) > 128 or not VERSION.fullmatch(version) or
             not isinstance(source_commit, str) or not COMMIT.fullmatch(source_commit)):
@@ -255,7 +255,7 @@ def verify_release(artifact: Path, bundle: Path, releases: Path, workspace: Path
         for item in sealed:
             item.check()
         _publisher_policy(output, filename, sha256, source_commit)
-        result = stage_release(archive.path, releases, sha256=sha256, version=version)
+        result = stage_release(archive.path, releases, sha256=sha256, version=version, reuse_existing=reuse_existing)
         for item in sealed:
             item.check()
         return {**result, "publisherVerified": True, "sourceCommit": source_commit,

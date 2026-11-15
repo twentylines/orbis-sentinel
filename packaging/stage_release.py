@@ -291,10 +291,10 @@ def _write_file(root: int, name: str, data: bytes, mode: int):
             os.close(descriptor)
 
 
-def _verify_tree(root: int, expected):
+def _verify_tree(root: int, expected, *, root_mode=0o700):
     observed, directories = {}, set()
     owner = os.fstat(root)
-    if owner.st_uid != os.geteuid() or stat.S_IMODE(owner.st_mode) != 0o700:
+    if root_mode not in (0o700, 0o755) or owner.st_uid != os.geteuid() or stat.S_IMODE(owner.st_mode) != root_mode:
         raise StageError("Prepared tree ownership or permissions changed")
 
     def visit(parent, prefix=""):
@@ -346,19 +346,21 @@ def _verify_tree(root: int, expected):
         raise StageError("Prepared tree does not match the verified release")
 
 
-def stage_release(artifact: Path, releases: Path, *, sha256: str, version: str):
+def stage_release(artifact: Path, releases: Path, *, sha256: str, version: str, reuse_existing=False):
     if not isinstance(sha256, str) or not SHA256.fullmatch(sha256) or not isinstance(version, str) or not VERSION.fullmatch(version):
         raise StageError("An approved checksum and component version are required")
     parent = _Parent(releases)
     temporary = f".stage-{uuid.uuid4().hex}"
     descriptor, identity, published, cleanup_safe = None, None, False, True
     try:
+        existing = None
         try:
-            os.stat(version, dir_fd=parent.fd, follow_symlinks=False)
+            existing = os.stat(version, dir_fd=parent.fd, follow_symlinks=False)
         except FileNotFoundError:
             pass
         else:
-            raise FileExistsError("This release version already exists")
+            if reuse_existing is not True:
+                raise FileExistsError("This release version already exists")
         os.mkdir(temporary, 0o700, dir_fd=parent.fd)
         identity = _identity(os.stat(temporary, dir_fd=parent.fd, follow_symlinks=False))
         descriptor = os.open(temporary, DIRECTORY_FLAGS, dir_fd=parent.fd)
@@ -371,6 +373,20 @@ def stage_release(artifact: Path, releases: Path, *, sha256: str, version: str):
             _snapshot_archive(artifact, frozen, sha256)
             first = _scan(frozen)
             _manifest(*first, version)
+            if existing is not None:
+                retained = os.open(version, DIRECTORY_FLAGS, dir_fd=parent.fd)
+                try:
+                    if _identity(os.fstat(retained)) != _identity(existing):
+                        raise StageError("Retained release identity changed")
+                    _verify_tree(retained, first[0], root_mode=0o755)
+                    parent.assert_current()
+                    if _identity(os.stat(version, dir_fd=parent.fd, follow_symlinks=False)) != _identity(existing):
+                        raise StageError("Retained release identity changed")
+                finally:
+                    os.close(retained)
+                return {"component": "orbis-sentinel", "version": version, "sha256": sha256,
+                        "directory": str(releases / version), "files": len(first[1]["files"]),
+                        "activated": False, "reused": True}
             second = _scan(frozen, lambda name, data, mode: _write_file(descriptor, name, data, mode))
             if first != second:
                 raise StageError("Frozen release changed during staging")

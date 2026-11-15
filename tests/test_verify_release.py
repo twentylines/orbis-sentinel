@@ -114,6 +114,17 @@ class PublisherVerificationTests(unittest.TestCase):
         self.assertEqual((self.workspace / "verification.stderr").read_bytes(), b"")
         self.assertTrue((Path(result["directory"]) / "release.json").is_file())
 
+    def test_reusing_an_existing_version_requires_fresh_publisher_verification(self):
+        with mock.patch.object(verify, '_run_verifier', return_value=json.dumps(self.verified()).encode()) as runner:
+            first = self.prepare()
+            second = self.prepare(reuse_existing=True)
+        self.assertEqual(runner.call_count, 2)
+        self.assertTrue(second['reused'])
+        self.assertEqual(second['directory'], first['directory'])
+        with mock.patch.object(verify, '_run_verifier', side_effect=verify.VerificationError('Bad signature')):
+            with self.assertRaises(verify.VerificationError):
+                self.prepare(reuse_existing=True)
+
     def test_wrong_publisher_identity_source_workflow_runner_and_issuer_never_stage(self):
         changes = {
             "issuer": "https://example.test/issuer", "sourceRepositoryURI": "https://github.com/other/project",

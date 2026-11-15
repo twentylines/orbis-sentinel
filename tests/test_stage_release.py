@@ -47,6 +47,30 @@ class StageTests(unittest.TestCase):
                 archive.addfile(member, io.BytesIO(data) if data is not None else None)
         return path, hashlib.sha256(path.read_bytes()).hexdigest()
 
+    def test_explicit_reuse_checks_archive_and_complete_retained_tree_without_replacing_it(self):
+        result = self.prepare()
+        installed = Path(result['directory'])
+        before = {p.relative_to(installed).as_posix(): p.stat().st_ino for p in installed.rglob('*')}
+        reused = stage.stage_release(self.artifact, self.releases, sha256=self.package['sha256'],
+            version=self.package['version'], reuse_existing=True)
+        self.assertTrue(reused['reused'])
+        self.assertEqual(before, {p.relative_to(installed).as_posix(): p.stat().st_ino for p in installed.rglob('*')})
+        self.assertEqual(list(self.releases.iterdir()), [installed])
+        with self.assertRaises(FileExistsError):
+            self.prepare()
+        with self.assertRaises(ValueError):
+            stage.stage_release(self.artifact, self.releases, sha256='0' * 64,
+                version=self.package['version'], reuse_existing=True)
+
+    def test_explicit_reuse_preserves_a_modified_retained_tree_and_rejects_it(self):
+        installed = Path(self.prepare()['directory'])
+        target = installed / 'src/orbis_sentinel/runtime.py'
+        target.write_bytes(b'changed retained code\n')
+        with self.assertRaises(ValueError):
+            stage.stage_release(self.artifact, self.releases, sha256=self.package['sha256'],
+                version=self.package['version'], reuse_existing=True)
+        self.assertEqual(target.read_bytes(), b'changed retained code\n')
+
     def reject_archive(self, mutate):
         artifact, checksum = self.changed_archive(mutate)
         with self.assertRaises((ValueError, OSError, tarfile.TarError, EOFError)):
