@@ -146,26 +146,35 @@ def main():
     observed = systemd.inspect('orbis-sentinel.service')
     assert all(observed[key] == service[key] for key in ('MainPID', 'InvocationID', 'ControlGroup'))
     activation._ready(systemd, new['version'])
-    systemd.stop()
+    current_directory = activation.ROOT / 'releases' / new['version']
+    current_files = snapshot(current_directory)
     adapter = subprocess.run([sys.executable, '-I', '-B', str(BASE / 'orbis-sentinel-install.py'),
         '--state-dir', str(BASE / 'orbis-state')], capture_output=True, timeout=300,
         env={'PATH': os.defpath, 'TMPDIR': str(BASE / 'tmp'), 'PYTHONDONTWRITEBYTECODE': '1'})
-    if adapter.returncode:
-        print(adapter.stderr.decode(errors='replace')[-2000:], file=sys.stderr)
-        raise RuntimeError('The pinned Orbis installer adapter did not complete')
-    installed = json.loads(adapter.stdout)
-    assert installed['activated'] is True and installed['publisherVerified'] is True
-    assert installed['version'] == '0.1.0-dev.11' and installed['previousVersion'] == new['version']
-    assert installed['sourceCommit'] == 'c9b44e69cb70fc0f8c7f48f4dd183b2c3f099f3a'
-    assert installed['retainedVersionsRemoved'] == 0 and installed['reused'] is True
-    activation._ready(systemd, installed['version'])
+    assert adapter.returncode != 0 and adapter.stdout == b'', 'The older pinned adapter must not replace the current component'
+    assert adapter.stderr == b'Sentinel setup did not complete; retained preparation and activation records require inspection.\n'
+    preparations = list((BASE / 'orbis-state').glob('sentinel-install-*'))
+    assert len(preparations) == 1
+    prepared = json.loads((preparations[0] / 'verify-package.stdout').read_bytes())
+    assert prepared['activated'] is False and prepared['publisherVerified'] is True
+    assert prepared['version'] == '0.1.0-dev.11'
+    assert prepared['sha256'] == '11c45eec2da2a4a28790ce5b231f72a2256b440bda3abdf42511f5ac7db7ff1a'
+    assert prepared['sourceCommit'] == 'c9b44e69cb70fc0f8c7f48f4dd183b2c3f099f3a'
+    assert (preparations[0] / 'activate-sentinel.stderr').read_bytes() == (
+        b'Sentinel activation did not complete; inspect the retained activation journal before retrying.\n')
+    assert not (preparations[0] / 'verification').exists()
+    assert {name: (activation.STATE / name).read_bytes() for name in before} == before
+    observed = systemd.inspect('orbis-sentinel.service')
+    assert all(observed[key] == service[key] for key in ('MainPID', 'InvocationID', 'ControlGroup'))
+    assert snapshot(current_directory) == current_files
+    activation._ready(systemd, new['version'])
     privileges(systemd)
     assert snapshot(old_directory) == old_files
     systemd.stop()
     print(json.dumps({'schema': 'orbis-sentinel.systemd-qualification.v1', 'passed': True,
         'cases': ['signed-first-install', 'fault-injected-health-rollback', 'signed-older-to-current-retry',
                   'retained-old-runtime', 'independent-unprivileged-service', 'older-installer-downgrade-refusal',
-                  'orbis-installer-cli', 'supervisor-stop'],
+                  'older-orbis-installer-cli-refusal', 'supervisor-stop'],
         'oldVersion': old['version'], 'newVersion': new['version'],
         'orbisAdapterSource': '9e8f9f5bce1a7e8a3a7ee1d0070dbcd20228684f',
         'publisherVerification': 'real', 'systemd': 'real', 'healthFaultOnly': 'explicit injection',
