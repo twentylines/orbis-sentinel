@@ -64,6 +64,14 @@ def main():
                    'XDG_DATA_HOME': str(work / 'data')}
     for name in ('cache', 'config', 'data'):
         (work / name).mkdir(mode=0o700)
+    # Podman bounds runroot to 50 bytes for its Unix sockets, even in a long checkout path.
+    runroot, podman_tmp = source / 'r', source / 't'
+    for path in (runroot, podman_tmp):
+        assert len(os.fsencode(path)) <= 50 and not path.exists() and not path.is_symlink()
+        path.mkdir(mode=0o700)
+    network_config, hooks = work / 'networks', work / 'hooks'
+    network_config.mkdir(mode=0o700)
+    hooks.mkdir(mode=0o700)
     number = 0
     def run(command, *, cwd=work, timeout=300, capture=False):
         nonlocal number
@@ -120,10 +128,12 @@ def main():
         resolv.unlink()
     resolv.write_bytes(Path('/etc/resolv.conf').read_bytes())
     identity = 'orbis-sentinel-' + uuid.uuid4().hex[:16]
-    podman = ['/usr/bin/podman', '--root', str(work / 'podman-storage'), '--runroot', str(work / 'podman-run'),
-              '--tmpdir', str(temporary), '--storage-driver=vfs', '--events-backend=file', '--cgroup-manager=systemd']
+    podman = ['/usr/bin/podman', '--root', str(work / 'podman-storage'), '--runroot', str(runroot),
+              '--tmpdir', str(podman_tmp), '--network-config-dir', str(network_config), '--hooks-dir', str(hooks),
+              '--storage-driver=vfs', '--events-backend=file', '--cgroup-manager=systemd']
     resource = {'schema': 'orbis-sentinel.qualification-resource.v1', 'owner': identity,
                 'rootfs': str(rootfs), 'storage': str(work / 'podman-storage'),
+                'runroot': str(runroot), 'temporary': str(podman_tmp), 'networks': str(network_config),
                 'lifecycle': 'Disposable CI-only rootfs; stop/remove only the labelled container; never upload rootfs'}
     (work / 'resource.json').write_text(json.dumps(resource, indent=2))
     started = network_created = False
