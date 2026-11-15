@@ -24,6 +24,8 @@ OLD = {'version': '0.1.0-dev.10', 'sourceCommit': '95610965b5c8d86113a6a58ff98e6
        'sha256': '918216769be653966f66d84c9ab0dc3f2c300d4b714d56a5454de504e17df9e9',
        'bundleSha256': '2e678fd249312c42d7675b04335b0c4bc8e983c9e9f472e3bd94ee398e9d4942'}
 BASE = Path('/opt/sentinel-qualification')
+ORBIS_ADAPTER_COMMIT = '9e8f9f5bce1a7e8a3a7ee1d0070dbcd20228684f'
+ORBIS_ADAPTER_SHA256 = '16440f3daf91035204bdba4f68123803e503c0221dc90bbd500ad31ab93e3995'
 
 
 def download(url, target, digest, maximum):
@@ -101,10 +103,13 @@ def main():
     inside = rootfs / str(BASE).lstrip('/')
     (inside / 'source/packaging').mkdir(parents=True, mode=0o755)
     (inside / 'tmp').mkdir(mode=0o700)
+    (inside / 'orbis-state').mkdir(mode=0o700)
     for name in ('activate_release.py', 'verify_release.py', 'stage_release.py'):
         shutil.copyfile(source / 'packaging' / name, inside / 'source/packaging' / name)
         (inside / 'source/packaging' / name).chmod(0o644)
     shutil.copyfile(source / 'tests/systemd_scenario.py', inside / 'scenario.py')
+    download('https://raw.githubusercontent.com/twentylines/orbis/' + ORBIS_ADAPTER_COMMIT + '/scripts/orbis-sentinel-install.py',
+             inside / 'orbis-sentinel-install.py', ORBIS_ADAPTER_SHA256, 1024 * 1024)
     gh = Path(shutil.which('gh', path=os.defpath)).resolve(strict=True)
     info = gh.stat()
     assert info.st_uid == 0 and not info.st_mode & 0o7022 and info.st_mode & 0o111
@@ -156,7 +161,7 @@ def main():
                 raise RuntimeError('The isolated systemd manager did not become ready')
             time.sleep(0.25)
         result = run([*podman, 'exec', '--env', 'TMPDIR=' + str(BASE / 'tmp'), '--env', 'PYTHONDONTWRITEBYTECODE=1',
-                      identity, '/usr/bin/python3', '-I', '-B', str(BASE / 'scenario.py')], timeout=300, capture=True)
+                      identity, '/usr/bin/python3', '-I', '-B', str(BASE / 'scenario.py')], timeout=600, capture=True)
         summary = json.loads(result.strip().splitlines()[-1])
         assert summary['passed'] is True
         (work / 'result.json').write_text(json.dumps(summary, indent=2))

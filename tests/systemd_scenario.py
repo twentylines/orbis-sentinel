@@ -147,10 +147,27 @@ def main():
     assert all(observed[key] == service[key] for key in ('MainPID', 'InvocationID', 'ControlGroup'))
     activation._ready(systemd, new['version'])
     systemd.stop()
+    adapter = subprocess.run([sys.executable, '-I', '-B', str(BASE / 'orbis-sentinel-install.py'),
+        '--state-dir', str(BASE / 'orbis-state')], capture_output=True, timeout=300,
+        env={'PATH': os.defpath, 'TMPDIR': str(BASE / 'tmp'), 'PYTHONDONTWRITEBYTECODE': '1'})
+    if adapter.returncode:
+        print(adapter.stderr.decode(errors='replace')[-2000:], file=sys.stderr)
+        raise RuntimeError('The pinned Orbis installer adapter did not complete')
+    installed = json.loads(adapter.stdout)
+    assert installed['activated'] is True and installed['publisherVerified'] is True
+    assert installed['version'] == '0.1.0-dev.11' and installed['previousVersion'] == new['version']
+    assert installed['sourceCommit'] == 'c9b44e69cb70fc0f8c7f48f4dd183b2c3f099f3a'
+    assert installed['retainedVersionsRemoved'] == 0 and installed['reused'] is True
+    activation._ready(systemd, installed['version'])
+    privileges(systemd)
+    assert snapshot(old_directory) == old_files
+    systemd.stop()
     print(json.dumps({'schema': 'orbis-sentinel.systemd-qualification.v1', 'passed': True,
         'cases': ['signed-first-install', 'fault-injected-health-rollback', 'signed-older-to-current-retry',
-                  'retained-old-runtime', 'independent-unprivileged-service', 'older-installer-downgrade-refusal', 'supervisor-stop'],
+                  'retained-old-runtime', 'independent-unprivileged-service', 'older-installer-downgrade-refusal',
+                  'orbis-installer-cli', 'supervisor-stop'],
         'oldVersion': old['version'], 'newVersion': new['version'],
+        'orbisAdapterSource': '9e8f9f5bce1a7e8a3a7ee1d0070dbcd20228684f',
         'publisherVerification': 'real', 'systemd': 'real', 'healthFaultOnly': 'explicit injection',
         'retainedOldFiles': len(old_files)}, sort_keys=True))
 
