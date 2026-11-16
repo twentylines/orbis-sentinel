@@ -74,7 +74,7 @@ class RecoveryProfiles:
                 _fail()
         return self._fd
 
-    def _contents(self, directory, digest):
+    def _contents(self, directory, digest, *, durable=False):
         if set(os.listdir(directory)) != {'identity.json'}:
             _fail()
         fd = os.open('identity.json', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=directory)
@@ -90,15 +90,18 @@ class RecoveryProfiles:
                 if not block:
                     break
                 body.extend(block)
-            if (len(body) != before.st_size or hashlib.sha256(body).hexdigest() != digest
-                    or _seal(before) != _seal(os.fstat(fd))
+            if len(body) != before.st_size or hashlib.sha256(body).hexdigest() != digest:
+                _fail()
+            if durable:
+                os.fsync(fd)
+            if (_seal(before) != _seal(os.fstat(fd))
                     or _seal(before) != _seal(os.stat('identity.json', dir_fd=directory, follow_symlinks=False))):
                 _fail()
             return _seal(before)
         finally:
             os.close(fd)
 
-    def _run(self, digest, action):
+    def _run(self, digest, action, *, durable=False):
         if type(digest) is not str or not _DIGEST.fullmatch(digest):
             _fail()
         base = self._directory()
@@ -108,7 +111,11 @@ class RecoveryProfiles:
             if (before.st_uid != sessions._OWNER_UID or stat.S_IMODE(before.st_mode) != 0o700
                     or _seal(before) != _seal(os.stat(digest, dir_fd=base, follow_symlinks=False))):
                 _fail()
-            content = self._contents(fd, digest)
+            content = self._contents(fd, digest, durable=durable)
+            if durable:
+                os.fsync(fd)
+                os.fsync(base)
+                os.fsync(self._store._directories[-1][1])
             result = action(os.path.join(self._path, digest), digest)
             if (content != self._contents(fd, digest) or _seal(before) != _seal(os.fstat(fd))
                     or _seal(before) != _seal(os.stat(digest, dir_fd=base, follow_symlinks=False))):
@@ -163,7 +170,7 @@ class RecoveryProfiles:
                         os.fsync(base)
                     finally:
                         os.close(directory)
-                metadata = self._run(digest, self._description)
+                metadata = self._run(digest, self._description, durable=True)
                 return PreparedProfile(digest, self, json.dumps(metadata, sort_keys=True, separators=(',', ':')))
             except Exception:
                 _fail()
@@ -172,7 +179,7 @@ class RecoveryProfiles:
         """Inspect retained material without a producer or automatic activation."""
         with self._store._mutex:
             try:
-                metadata = self._run(digest, self._description)
+                metadata = self._run(digest, self._description, durable=True)
                 return PreparedProfile(digest, self, json.dumps(metadata, sort_keys=True, separators=(',', ':')))
             except Exception:
                 _fail()
@@ -181,7 +188,7 @@ class RecoveryProfiles:
         with self._store._mutex:
             try:
                 digest = self._prepared(prepared)
-                metadata = self._run(digest, self._description)
+                metadata = self._run(digest, self._description, durable=True)
                 if json.dumps(metadata, sort_keys=True, separators=(',', ':')) != prepared._metadata:
                     _fail()
                 return self._store.begin_operator_enrollment(expected_generation=expected_generation,
@@ -197,7 +204,7 @@ class RecoveryProfiles:
                 def inspected(target):
                     if target != digest:
                         _fail()
-                    value = self._run(target, self._description)
+                    value = self._run(target, self._description, durable=True)
                     if json.dumps(value, sort_keys=True, separators=(',', ':')) != prepared._metadata:
                         _fail()
                     return {'schema': 'orbis.sentinel-identity-description.v1', **value}

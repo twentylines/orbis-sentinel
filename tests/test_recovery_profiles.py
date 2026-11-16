@@ -150,6 +150,33 @@ class RecoveryProfilesTests(unittest.TestCase):
         self.assertEqual(self.file().read_bytes(), self.body('b'))
         self.assertEqual(self.store.operator_status()['state'], 'enrolled')
 
+    def test_retry_and_retained_inspection_repeat_durability_barriers_before_revocation(self):
+        body = self.body('c')
+        digest = hashlib.sha256(body).hexdigest()
+        with mock.patch.object(profiles.os, 'fsync', side_effect=OSError('Synthetic flush failure')):
+            with self.assertRaises(profiles.RecoveryProfileError):
+                self.profiles.prepare(body)
+        candidate = Path(self.temp.name) / 'profiles' / digest / 'identity.json'
+        self.assertEqual(candidate.read_bytes(), body)
+        self.inspect.reset_mock()
+        with mock.patch.object(profiles.os, 'fsync', side_effect=OSError('Synthetic flush failure')):
+            with self.assertRaises(profiles.RecoveryProfileError):
+                self.profiles.prepare(body)
+            with self.assertRaises(profiles.RecoveryProfileError):
+                self.profiles.inspect_retained(digest)
+        self.inspect.assert_not_called()
+        prepared = self.profiles.inspect_retained(digest)
+        with mock.patch.object(profiles.os, 'fsync', side_effect=OSError('Synthetic flush failure')):
+            with self.assertRaises(profiles.RecoveryProfileError):
+                self.begin(prepared)
+        self.assertEqual(self.store.operator_status()['state'], 'enrolled')
+        pending = self.begin(prepared)
+        with mock.patch.object(profiles.os, 'fsync', side_effect=OSError('Synthetic flush failure')):
+            with self.assertRaises(profiles.RecoveryProfileError):
+                self.profiles.complete(prepared, change_token=pending['changeToken'], expected_generation=pending['generation'])
+        self.assertEqual(self.store.operator_status()['state'], 'pending')
+        self.profiles.complete(prepared, change_token=pending['changeToken'], expected_generation=pending['generation'])
+
     def test_linked_or_broadly_readable_profile_is_rejected_without_breaking_key_auth(self):
         emergency = self.key_session()
         file = self.file()
