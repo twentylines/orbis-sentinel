@@ -139,7 +139,7 @@ class RecoveryWorker:
     def _directory(self):
         if sys.platform != 'linux' or os.geteuid() != _OWNER_UID or self._closed:
             _fail()
-        self._store._verify()
+        self._store._verify_resource()
         parent = self._store._directories[-1][1]
         if self._fd is None:
             try:
@@ -268,7 +268,7 @@ class RecoveryWorker:
             body = json.dumps(credentials, separators=(',', ':'), allow_nan=False).encode('ascii')
             if not 0 < len(body) <= 32768:
                 _fail()
-        with self._store._mutex:
+        with self._store._worker_mutex, self._store._borrow():
             record = self._read()
             if record is not None and record['phase'] != 'clean':
                 self._cleanup(record)
@@ -326,7 +326,7 @@ class RecoveryWorker:
             _fail()
 
     def close(self):
-        with self._store._mutex:
+        with self._store._worker_mutex:
             self._closed = True
             if self._fd is not None:
                 os.close(self._fd)

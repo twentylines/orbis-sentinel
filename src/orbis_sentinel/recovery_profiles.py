@@ -1,6 +1,7 @@
 """Protected credential material for the independently enrolled recovery worker."""
 
 from dataclasses import dataclass
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -53,8 +54,16 @@ class RecoveryProfiles:
         self._closed = False
         self._path = os.path.join(store._directory, 'profiles')
 
+    @contextmanager
+    def _operation(self):
+        try:
+            with self._store._profile_mutex, self._store._borrow():
+                yield
+        except Exception:
+            _fail()
+
     def _directory(self, *, create=False):
-        self._store._verify()
+        self._store._verify_resource()
         if self._closed:
             _fail()
         root = self._store._directories[-1][1]
@@ -148,7 +157,7 @@ class RecoveryProfiles:
         if type(identity_bytes) is not bytes or not 1 <= len(identity_bytes) <= _MAX_BYTES:
             _fail()
         digest = hashlib.sha256(identity_bytes).hexdigest()
-        with self._store._mutex:
+        with self._operation():
             try:
                 base = self._directory(create=True)
                 names = os.listdir(base)
@@ -177,7 +186,7 @@ class RecoveryProfiles:
 
     def inspect_retained(self, digest):
         """Inspect retained material without a producer or automatic activation."""
-        with self._store._mutex:
+        with self._operation():
             try:
                 metadata = self._run(digest, self._description, durable=True)
                 return PreparedProfile(digest, self, json.dumps(metadata, sort_keys=True, separators=(',', ':')))
@@ -185,7 +194,7 @@ class RecoveryProfiles:
                 _fail()
 
     def begin(self, prepared, *, expected_generation, expected_revision):
-        with self._store._mutex:
+        with self._operation():
             try:
                 digest = self._prepared(prepared)
                 metadata = self._run(digest, self._description, durable=True)
@@ -198,7 +207,7 @@ class RecoveryProfiles:
                 _fail()
 
     def complete(self, prepared, *, change_token, expected_generation):
-        with self._store._mutex:
+        with self._operation():
             try:
                 digest = self._prepared(prepared)
                 def inspected(target):
@@ -215,14 +224,14 @@ class RecoveryProfiles:
 
     def verify(self, digest, challenge, credentials):
         """The session store, not a browser field, selects the active digest."""
-        with self._store._mutex:
+        with self._operation():
             try:
                 return self._run(digest, lambda directory, expected: self._verify_worker(directory, expected, challenge, credentials))
             except Exception:
                 _fail()
 
     def close(self):
-        with self._store._mutex:
+        with self._store._profile_mutex:
             self._closed = True
             if self._fd is not None:
                 os.close(self._fd)

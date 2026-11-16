@@ -671,14 +671,17 @@ class RecoverySessionsTests(unittest.TestCase):
     def test_shutdown_waits_for_inflight_verification_before_releasing_store_ownership(self):
         challenge = self.challenge()
         entered, release, closing, closed = (threading.Event() for _ in range(4))
-        results = []
+        results, failures = [], []
         def verify(_digest, issued):
             entered.set()
             if not release.wait(timeout=3):
                 raise RuntimeError('Verification test did not release')
             return self.proof(issued)
         def authenticate():
-            results.append(self.store.complete(challenge=challenge, browser_binding=self.binding, origin=self.origin, verifier=verify))
+            try:
+                results.append(self.store.complete(challenge=challenge, browser_binding=self.binding, origin=self.origin, verifier=verify))
+            except recovery.RecoverySessionError:
+                failures.append(True)
         def close():
             closing.set()
             self.store.close()
@@ -697,10 +700,10 @@ class RecoverySessionsTests(unittest.TestCase):
             if stop.ident is not None:
                 stop.join(timeout=3)
         self.assertTrue(closed.is_set())
-        self.assertEqual(len(results), 1)
+        self.assertEqual(results, [])
+        self.assertEqual(failures, [True])
         self.store = self.open()
-        with self.assertRaises(recovery.RecoverySessionError):
-            self.session(results[0])
+        self.assertEqual(self.store._db.execute('SELECT count(*) FROM sessions').fetchone()[0], 0)
 
     def test_lifetime_lock_file_replacement_permissions_and_closed_store(self):
         with self.assertRaises(BlockingIOError):

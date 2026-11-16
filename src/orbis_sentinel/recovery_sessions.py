@@ -1,6 +1,7 @@
 """Root-owned recovery sessions; these records never authorize host operations."""
 
 import base64
+from contextlib import contextmanager
 import fcntl
 import hashlib
 import json
@@ -107,6 +108,11 @@ class RecoverySessions:
         self._clock = clock or (lambda: time.time_ns() // 1_000_000)
         self._pid = os.getpid()
         self._mutex = threading.RLock()
+        self._profile_mutex = threading.RLock()
+        self._worker_mutex = threading.RLock()
+        self._idle = threading.Condition(self._mutex)
+        self._borrowers = {}
+        self._closing = False
         self._db = None
         self._files = []
         self._directories = []
@@ -176,8 +182,8 @@ class RecoverySessions:
         self._verify()
         return fd
 
-    def _verify(self):
-        if self._closed or os.getpid() != self._pid:
+    def _verify(self, *, resources=False):
+        if self._closed or (self._closing and not resources) or os.getpid() != self._pid:
             _fail()
         for path, fd, identity in self._directories:
             for info in (os.fstat(fd), os.lstat(path)):
@@ -190,6 +196,31 @@ class RecoverySessions:
                 if (not stat.S_ISREG(info.st_mode) or (info.st_dev, info.st_ino) != identity
                         or info.st_uid != _OWNER_UID or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600):
                     _fail()
+
+    def _verify_resource(self):
+        with self._mutex:
+            if not self._borrowers.get(threading.get_ident()):
+                _fail()
+            self._verify(resources=True)
+
+    @contextmanager
+    def _borrow(self):
+        """Pin root resources during bounded callbacks without locking key auth."""
+        owner = threading.get_ident()
+        with self._mutex:
+            self._verify()
+            self._borrowers[owner] = self._borrowers.get(owner, 0) + 1
+        try:
+            yield
+        finally:
+            with self._mutex:
+                try:
+                    self._verify(resources=True)
+                finally:
+                    self._borrowers[owner] -= 1
+                    if not self._borrowers[owner]:
+                        del self._borrowers[owner]
+                    self._idle.notify_all()
 
     def _transaction(self, action):
         with self._mutex:
@@ -355,7 +386,7 @@ class RecoverySessions:
         digest = _token(change_token)
         if not _integer(expected_generation) or not callable(inspector):
             _fail()
-        with self._mutex:
+        with self._borrow():
             def planned():
                 state = self._operator_enrollment()
                 if (state['generation'] != expected_generation or state['nonce'] is None
@@ -496,7 +527,7 @@ class RecoverySessions:
     def complete(self, *, challenge, browser_binding, origin, verifier):
         if not callable(verifier):
             _fail()
-        with self._mutex:
+        with self._borrow():
             identity, pending = self._consume_challenge(challenge, browser_binding, origin, ('password', 'passkey'))
             # Persist the attempt before invoking native crypto; crashes cannot replay it.
             proof = verifier(identity['identitySha256'], challenge)
@@ -591,6 +622,16 @@ class RecoverySessions:
 
     def close(self):
         with self._mutex:
+            if self._closed:
+                return
+            if self._borrowers.get(threading.get_ident()):
+                _fail()
+            self._closing = True
+            self._idle.notify_all()
+            while self._borrowers:
+                self._idle.wait()
+            if self._closed:
+                return
             self._closed = True
             if self._db is not None:
                 self._db.close()
