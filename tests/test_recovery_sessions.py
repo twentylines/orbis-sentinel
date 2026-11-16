@@ -49,6 +49,198 @@ class RecoverySessionsTests(unittest.TestCase):
     def session(self, result, **changes):
         return self.store.session(token=result['token'], origin=self.origin, **changes)
 
+    def prepare_key(self, expected_revision=None):
+        return self.store.prepare_recovery_key(origin=self.origin, expected_revision=expected_revision)
+
+    def activate_key(self, pending, expected_revision=None):
+        self.store.activate_recovery_key(revision=pending['revision'], recovery_key=pending['recoveryKey'],
+                                         expected_revision=expected_revision)
+
+    def key_session(self, key, challenge=None, **changes):
+        return self.store.complete_recovery_key(challenge=challenge or self.challenge('recovery-key'),
+                                                browser_binding=self.binding, origin=self.origin,
+                                                recovery_key=key, **changes)
+
+    def test_recovery_key_is_an_independent_principal_without_orbis_identity(self):
+        pending = self.prepare_key()
+        self.activate_key(pending)
+        operator = self.complete()
+        key = self.key_session(pending['recoveryKey'])
+        self.store.revoke()
+        with self.assertRaises(recovery.RecoverySessionError):
+            self.session(operator)
+        session = self.session(key, csrf=key['csrfToken'], fresh=True)
+        self.assertEqual(session['method'], 'recovery-key')
+        self.assertEqual(session['principal'], 'recovery-key')
+        self.assertIsNone(session['accountId'])
+        self.assertEqual(self.session(self.key_session(pending['recoveryKey']))['principal'], 'recovery-key')
+        options = self.store.authentication_options()
+        self.assertFalse(options['password'])
+        self.assertTrue(options['recoveryKey'])
+        self.assertEqual(options['credentialIds'], [])
+        self.assertEqual(options['totp'], {'password': False, 'passkey': False})
+
+    def test_preparing_or_losing_a_replacement_does_not_revoke_the_working_key(self):
+        current = self.prepare_key()
+        with self.assertRaises(recovery.RecoverySessionError):
+            self.challenge('recovery-key')
+        self.activate_key(current)
+        result = self.key_session(current['recoveryKey'])
+        replacement = self.prepare_key(current['revision'])
+        self.assertEqual(self.session(result)['method'], 'recovery-key')
+        with self.assertRaises(recovery.RecoverySessionError):
+            self.key_session(replacement['recoveryKey'])
+        self.assertEqual(self.session(self.key_session(current['recoveryKey']))['method'], 'recovery-key')
+        self.now += 600_001
+        with self.assertRaises(recovery.RecoverySessionError):
+            self.activate_key(replacement, current['revision'])
+        self.assertEqual(self.session(result)['method'], 'recovery-key')
+
+    def test_rotation_requires_possession_and_revokes_only_key_authority(self):
+        current = self.prepare_key()
+        self.activate_key(current)
+        operator = self.complete()
+        result = self.key_session(current['recoveryKey'])
+        challenge = self.challenge('recovery-key')
+        replacement = self.prepare_key(current['revision'])
+        with self.assertRaises(recovery.RecoverySessionError):
+            self.store.activate_recovery_key(revision=replacement['revision'], recovery_key=current['recoveryKey'],
+                                             expected_revision=current['revision'])
+        self.assertEqual(self.session(result)['method'], 'recovery-key')
+        self.activate_key(replacement, current['revision'])
+        with self.assertRaises(recovery.RecoverySessionError):
+            self.session(result)
+        with self.assertRaises(recovery.RecoverySessionError):
+            self.key_session(current['recoveryKey'], challenge=challenge)
+        with self.assertRaises(recovery.RecoverySessionError):
+            self.key_session(current['recoveryKey'])
+        self.assertEqual(self.session(operator)['principal'], 'orbis-operator')
+        self.assertEqual(self.session(self.key_session(replacement['recoveryKey']))['method'], 'recovery-key')
+
+    def test_key_rotation_rejects_stale_activation_and_preparation(self):
+        first = self.prepare_key()
+        rival = self.prepare_key()
+        self.activate_key(first)
+        with self.assertRaises(recovery.RecoverySessionError):
+            self.activate_key(rival, first['revision'])
+        with self.assertRaises(recovery.RecoverySessionError):
+            self.prepare_key()
+        with self.assertRaises(recovery.RecoverySessionError):
+            self.store.revoke_recovery_key(expected_revision=rival['revision'])
+        self.assertEqual(self.session(self.key_session(first['recoveryKey']))['method'], 'recovery-key')
+
+    def test_key_revocation_preserves_orbis_sign_in_and_sessions(self):
+        key = self.prepare_key()
+        self.activate_key(key)
+        operator = self.complete()
+        result = self.key_session(key['recoveryKey'])
+        self.store.revoke_recovery_key(expected_revision=key['revision'])
+        with self.assertRaises(recovery.RecoverySessionError):
+            self.session(result)
+        with self.assertRaises(recovery.RecoverySessionError):
+            self.challenge('recovery-key')
+        self.assertEqual(self.session(operator)['accountId'], 1)
+        self.assertEqual(self.session(self.complete())['accountId'], 1)
+
+    def test_main_account_reenrollment_preserves_key_sessions_and_challenges(self):
+        key = self.prepare_key()
+        self.activate_key(key)
+        result = self.key_session(key['recoveryKey'])
+        challenge = self.challenge('recovery-key')
+        self.profile = {**self.profile, 'revision': 'c' * 64, 'accountId': 2, 'totpEnabled': True}
+        self.store.enroll(self.profile)
+        self.assertEqual(self.session(result)['method'], 'recovery-key')
+        self.assertEqual(self.session(self.key_session(key['recoveryKey'], challenge=challenge))['method'], 'recovery-key')
+
+    def test_key_secret_is_canonical_random_and_only_its_digest_is_persisted(self):
+        key = self.prepare_key()
+        self.assertRegex(key['recoveryKey'], r'^orbis-recovery-[A-Za-z0-9_-]{43}$')
+        self.activate_key(key)
+        self.key_session(key['recoveryKey'])
+        with open(os.path.join(self.temp.name, 'recovery.sqlite3'), 'rb') as stream:
+            self.assertNotIn(key['recoveryKey'].encode(), stream.read())
+        options = self.store.authentication_options()
+        self.assertNotIn('digest', options)
+        self.assertNotIn('revision', options)
+
+    def test_wrong_or_malformed_key_consumes_the_challenge_before_comparison(self):
+        key = self.prepare_key()
+        self.activate_key(key)
+        for value in (None, 123, '', 'arbitrary', key['recoveryKey'] + '=', 'orbis-recovery-' + secrets.token_urlsafe(32)):
+            challenge = self.challenge('recovery-key')
+            with self.assertRaises(recovery.RecoverySessionError):
+                self.key_session(value, challenge=challenge)
+            with self.assertRaises(recovery.RecoverySessionError):
+                self.key_session(key['recoveryKey'], challenge=challenge)
+
+    def test_native_proofs_and_key_secrets_cannot_be_exchanged_between_methods(self):
+        key = self.prepare_key()
+        self.activate_key(key)
+        verifier = mock.Mock()
+        challenge = self.challenge('recovery-key')
+        with self.assertRaises(recovery.RecoverySessionError):
+            self.store.complete(challenge=challenge, browser_binding=self.binding, origin=self.origin, verifier=verifier)
+        verifier.assert_not_called()
+        self.key_session(key['recoveryKey'], challenge=challenge)
+        challenge = self.challenge('password')
+        with self.assertRaises(recovery.RecoverySessionError):
+            self.key_session(key['recoveryKey'], challenge=challenge)
+        self.complete(challenge)
+
+    def test_recovery_key_never_bypasses_browser_binding_origin_csrf_or_idle_expiry(self):
+        key = self.prepare_key()
+        self.activate_key(key)
+        challenge = self.challenge('recovery-key')
+        for origin, binding in [('https://other.example', self.binding), (self.origin, secrets.token_urlsafe(32))]:
+            with self.assertRaises(recovery.RecoverySessionError):
+                self.store.complete_recovery_key(challenge=challenge, browser_binding=binding, origin=origin, recovery_key=key['recoveryKey'])
+        result = self.key_session(key['recoveryKey'], challenge=challenge)
+        with self.assertRaises(recovery.RecoverySessionError):
+            self.session(result, csrf=secrets.token_urlsafe(32), fresh=True)
+        self.now += 900_001
+        with self.assertRaises(recovery.RecoverySessionError):
+            self.session(result)
+        self.store.logout(token=result['token'], origin=self.origin, csrf=result['csrfToken'])
+
+    def test_key_state_and_rate_limit_survive_restart_without_retaining_browser_authority(self):
+        key = self.prepare_key()
+        self.activate_key(key)
+        result = self.key_session(key['recoveryKey'])
+        self.store.revoke()
+        self.store.close()
+        self.store = self.open()
+        with self.assertRaises(recovery.RecoverySessionError):
+            self.session(result)
+        for _ in range(9):
+            with self.assertRaises(recovery.RecoverySessionError):
+                self.key_session('invalid')
+        self.store.close()
+        self.store = self.open()
+        with self.assertRaises(recovery.RecoverySessionError):
+            self.key_session(key['recoveryKey'])
+        self.now += 60_001
+        self.assertEqual(self.session(self.key_session(key['recoveryKey']))['method'], 'recovery-key')
+
+    def test_failed_orbis_attempts_do_not_lock_the_independent_key(self):
+        key = self.prepare_key()
+        self.activate_key(key)
+        for _ in range(10):
+            with self.assertRaises(recovery.RecoverySessionError):
+                self.complete(verified=False)
+        with self.assertRaises(recovery.RecoverySessionError):
+            self.complete()
+        self.assertEqual(self.session(self.key_session(key['recoveryKey']))['method'], 'recovery-key')
+
+    def test_enrollment_and_key_origins_cannot_silently_diverge(self):
+        for origin in ('http://orbis.example', 'https://@orbis.example', 'https://orbis.example/', 'https://other.example'):
+            with self.assertRaises(recovery.RecoverySessionError):
+                self.store.prepare_recovery_key(origin=origin, expected_revision=None)
+        key = self.prepare_key()
+        self.activate_key(key)
+        with self.assertRaises(recovery.RecoverySessionError):
+            self.store.enroll({**self.profile, 'revision': 'c' * 64, 'origin': 'https://other.example'})
+        self.assertEqual(self.session(self.key_session(key['recoveryKey']))['method'], 'recovery-key')
+
     def test_password_session_csrf_logout_and_no_host_authority(self):
         result = self.complete()
         self.assertEqual(self.session(result)['accountId'], 1)
@@ -73,6 +265,17 @@ class RecoverySessionsTests(unittest.TestCase):
         self.assertEqual(self.store._db.execute('PRAGMA journal_mode').fetchone()[0], 'delete')
         self.assertEqual(self.store._db.execute('PRAGMA synchronous').fetchone()[0], 3)
         self.assertEqual(self.store._db.execute('PRAGMA integrity_check').fetchone()[0], 'ok')
+
+    def test_expired_logout_is_atomic_idempotent_and_still_requires_the_matching_csrf(self):
+        result = self.complete()
+        self.now += 900_001
+        with self.assertRaises(recovery.RecoverySessionError):
+            self.session(result)
+        with self.assertRaises(recovery.RecoverySessionError):
+            self.store.logout(token=result['token'], origin=self.origin, csrf=secrets.token_urlsafe(32))
+        self.store.logout(token=result['token'], origin=self.origin, csrf=result['csrfToken'])
+        self.store.logout(token=result['token'], origin=self.origin, csrf=result['csrfToken'])
+        self.assertEqual(self.store._db.execute('SELECT count(*) FROM sessions').fetchone()[0], 0)
 
     def test_browser_binding_and_origin_are_checked_before_native_crypto(self):
         challenge = self.challenge()
@@ -274,6 +477,40 @@ class RecoverySessionsTests(unittest.TestCase):
             return proof
         with self.assertRaises(recovery.RecoverySessionError):
             self.store.complete(challenge=challenge, browser_binding=self.binding, origin=self.origin, verifier=verify)
+
+    def test_shutdown_waits_for_inflight_verification_before_releasing_store_ownership(self):
+        challenge = self.challenge()
+        entered, release, closing, closed = (threading.Event() for _ in range(4))
+        results = []
+        def verify(_digest, issued):
+            entered.set()
+            if not release.wait(timeout=3):
+                raise RuntimeError('Verification test did not release')
+            return self.proof(issued)
+        def authenticate():
+            results.append(self.store.complete(challenge=challenge, browser_binding=self.binding, origin=self.origin, verifier=verify))
+        def close():
+            closing.set()
+            self.store.close()
+            closed.set()
+        auth = threading.Thread(target=authenticate)
+        stop = threading.Thread(target=close)
+        auth.start()
+        try:
+            self.assertTrue(entered.wait(timeout=2))
+            stop.start()
+            self.assertTrue(closing.wait(timeout=2))
+            self.assertFalse(closed.wait(timeout=0.05))
+        finally:
+            release.set()
+            auth.join(timeout=3)
+            if stop.ident is not None:
+                stop.join(timeout=3)
+        self.assertTrue(closed.is_set())
+        self.assertEqual(len(results), 1)
+        self.store = self.open()
+        with self.assertRaises(recovery.RecoverySessionError):
+            self.session(results[0])
 
     def test_lifetime_lock_file_replacement_permissions_and_closed_store(self):
         with self.assertRaises(BlockingIOError):
