@@ -231,6 +231,34 @@ class RecoverySessionsTests(unittest.TestCase):
             self.complete()
         self.assertEqual(self.session(self.key_session(key['recoveryKey']))['method'], 'recovery-key')
 
+    def test_main_and_emergency_queue_and_session_limits_do_not_exhaust_each_other(self):
+        key = self.prepare_key()
+        self.activate_key(key)
+        for _ in range(32):
+            self.challenge()
+        key_challenge = self.challenge('recovery-key')
+        self.key_session(key['recoveryKey'], challenge=key_challenge)
+        self.now += 120_001
+        operators = []
+        for index in range(16):
+            if index % 8 == 0:
+                self.now += 60_000
+            operators.append(self.complete())
+        for _ in range(3):
+            self.assertEqual(self.session(self.key_session(key['recoveryKey']))['method'], 'recovery-key')
+        with self.assertRaises(recovery.RecoverySessionError):
+            self.key_session(key['recoveryKey'])
+        with self.assertRaises(recovery.RecoverySessionError):
+            self.complete()
+        self.store.logout(token=operators[0]['token'], origin=self.origin, csrf=operators[0]['csrfToken'])
+        self.assertEqual(self.session(self.complete())['principal'], 'orbis-operator')
+        for _ in range(8):
+            self.challenge('recovery-key')
+        with self.assertRaises(recovery.RecoverySessionError):
+            self.challenge('recovery-key')
+        self.challenge('password')
+        self.assertEqual(self.store._db.execute('SELECT count(*) FROM sessions').fetchone()[0], 20)
+
     def test_enrollment_and_key_origins_cannot_silently_diverge(self):
         for origin in ('http://orbis.example', 'https://@orbis.example', 'https://orbis.example/', 'https://other.example'):
             with self.assertRaises(recovery.RecoverySessionError):

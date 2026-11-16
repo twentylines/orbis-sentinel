@@ -96,7 +96,7 @@ def _enrollment(value):
 
 
 class RecoverySessions:
-    """One privileged owner; verifier callbacks run only after durable consumption.
+    """One protected store owner; verifier callbacks follow durable consumption.
 
     Enrollment is an internal supervisor action, never browser input. Its digest,
     factors and counters must describe the same protected profile passed to the
@@ -324,7 +324,9 @@ class RecoverySessions:
             if origin != identity['origin'] or (method == 'passkey' and not identity['credentials']):
                 _fail()
             self._db.execute('DELETE FROM challenges WHERE created<?', (now - _CHALLENGE_MS,))
-            if self._db.execute('SELECT count(*) FROM challenges').fetchone()[0] >= 32:
+            emergency = method == 'recovery-key'
+            count = self._db.execute("SELECT count(*) FROM challenges WHERE (method='recovery-key')=?", (emergency,)).fetchone()[0]
+            if count >= (8 if emergency else 32):
                 _fail()
             self._db.execute('INSERT INTO challenges VALUES (?,?,?,?,?)', (_token(raw), binding, method, now, identity['revision']))
             return {'challenge': raw, 'expiresAtMs': now + _CHALLENGE_MS}
@@ -354,7 +356,9 @@ class RecoverySessions:
     def _create_session(self, identity, method, now):
         token, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
         self._db.execute('DELETE FROM sessions WHERE created<? OR touched<?', (now - _SESSION_MS, now - _IDLE_MS))
-        if self._db.execute('SELECT count(*) FROM sessions').fetchone()[0] >= 16:
+        emergency = method == 'recovery-key'
+        count = self._db.execute("SELECT count(*) FROM sessions WHERE (method='recovery-key')=?", (emergency,)).fetchone()[0]
+        if count >= (4 if emergency else 16):
             _fail()
         self._db.execute('INSERT INTO sessions VALUES (?,?,?,?,?,?)', (_token(token), _token(csrf), identity['revision'], method, now, now))
         return {'token': token, 'csrfToken': csrf, 'accountId': identity.get('accountId'), 'expiresAtMs': now + _IDLE_MS}
