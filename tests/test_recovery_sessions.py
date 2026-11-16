@@ -269,6 +269,168 @@ class RecoverySessionsTests(unittest.TestCase):
             self.store.enroll({**self.profile, 'revision': 'c' * 64, 'origin': 'https://other.example'})
         self.assertEqual(self.session(self.key_session(key['recoveryKey']))['method'], 'recovery-key')
 
+    def begin_enrollment(self, **changes):
+        status = self.store.operator_status()
+        return self.store.begin_operator_enrollment(expected_generation=status['generation'],
+                                                    expected_revision=status['revision'],
+                                                    identity_sha256=changes.get('identity_sha256', 'c' * 64), origin=self.origin)
+
+    def finish_enrollment(self, pending, **changes):
+        profile = {**self.profile, 'identitySha256': 'c' * 64, 'revision': 'd' * 64, **changes}
+        return self.store.complete_operator_enrollment(profile, change_token=pending['changeToken'], expected_generation=pending['generation'])
+
+    def test_operator_enrollment_status_distinguishes_absence_revocation_and_unavailable_storage(self):
+        self.assertEqual(self.store.operator_status(), {'generation': 1, 'revision': self.profile['revision'], 'state': 'enrolled'})
+        self.store.revoke()
+        self.assertEqual(self.store.operator_status(), {'generation': 2, 'revision': None, 'state': 'revoked'})
+        self.store.close()
+        with self.assertRaises(recovery.RecoverySessionError):
+            self.store.operator_status()
+        with tempfile.TemporaryDirectory() as directory:
+            fresh = recovery.RecoverySessions(directory, clock=lambda: self.now)
+            self.addCleanup(fresh.close)
+            self.assertEqual(fresh.operator_status(), {'generation': 0, 'revision': None, 'state': 'never-enrolled'})
+
+    def test_begin_enrollment_durably_revokes_operator_before_main_mutation_and_preserves_key(self):
+        key = self.prepare_key()
+        self.activate_key(key)
+        operator, emergency = self.complete(), self.key_session(key['recoveryKey'])
+        challenge = self.challenge('passkey')
+        pending = self.begin_enrollment()
+        self.assertEqual(self.store.operator_status(), {'generation': pending['generation'], 'revision': None, 'state': 'pending'})
+        with self.assertRaises(recovery.RecoverySessionError):
+            self.session(operator)
+        verifier = mock.Mock()
+        with self.assertRaises(recovery.RecoverySessionError):
+            self.store.complete(challenge=challenge, browser_binding=self.binding, origin=self.origin, verifier=verifier)
+        verifier.assert_not_called()
+        with self.assertRaises(recovery.RecoverySessionError):
+            self.challenge()
+        self.assertEqual(self.session(emergency)['principal'], 'recovery-key')
+        self.assertEqual(self.session(self.key_session(key['recoveryKey']))['principal'], 'recovery-key')
+        with open(os.path.join(self.temp.name, 'recovery.sqlite3'), 'rb') as stream:
+            self.assertNotIn(pending['changeToken'].encode(), stream.read())
+
+    def test_completion_is_bound_to_the_planned_profile_origin_generation_and_single_use_nonce(self):
+        pending = self.begin_enrollment()
+        for changes in ({'identitySha256': 'e' * 64}, {'origin': 'https://other.example'}, {'revision': self.profile['revision']}):
+            with self.assertRaises(recovery.RecoverySessionError):
+                self.finish_enrollment(pending, **changes)
+        for token, generation in [(secrets.token_urlsafe(32), pending['generation']),
+                                  (pending['changeToken'], pending['generation'] + 1)]:
+            with self.assertRaises(recovery.RecoverySessionError):
+                self.finish_enrollment({'changeToken': token, 'generation': generation})
+        result = self.finish_enrollment(pending)
+        self.assertEqual(result, {'generation': pending['generation'] + 1, 'revision': 'd' * 64, 'state': 'enrolled'})
+        with self.assertRaises(recovery.RecoverySessionError):
+            self.finish_enrollment(pending)
+        self.profile = {**self.profile, 'identitySha256': 'c' * 64, 'revision': 'd' * 64}
+        self.assertEqual(self.session(self.complete())['principal'], 'orbis-operator')
+
+    def test_stale_or_wrong_origin_begin_does_not_revoke_a_valid_operator(self):
+        result = self.complete()
+        status = self.store.operator_status()
+        arguments = {'expected_generation': status['generation'], 'expected_revision': status['revision'],
+                     'identity_sha256': 'c' * 64, 'origin': self.origin}
+        for changes in ({'expected_generation': 0}, {'expected_generation': True}, {'expected_revision': 'e' * 64},
+                        {'identity_sha256': 'untrusted'}, {'origin': 'https://other.example'}):
+            with self.assertRaises(recovery.RecoverySessionError):
+                self.store.begin_operator_enrollment(**{**arguments, **changes})
+            self.assertEqual(self.session(result)['accountId'], 1)
+            self.assertEqual(self.store.operator_status(), status)
+
+    def test_competing_begin_can_create_only_one_pending_enrollment(self):
+        status = self.store.operator_status()
+        barrier, results = threading.Barrier(2), []
+        def begin():
+            barrier.wait(timeout=3)
+            try:
+                result = self.store.begin_operator_enrollment(expected_generation=status['generation'], expected_revision=status['revision'],
+                                                               identity_sha256='c' * 64, origin=self.origin)
+                results.append(result)
+            except recovery.RecoverySessionError:
+                results.append(None)
+        threads = [threading.Thread(target=begin) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=3)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(sum(result is not None for result in results), 1)
+        self.finish_enrollment(next(result for result in results if result is not None))
+
+    def test_crash_reopen_retains_pending_revocation_until_explicit_bound_completion(self):
+        pending = self.begin_enrollment()
+        self.store.close()
+        self.store = self.open()
+        self.assertEqual(self.store.operator_status()['state'], 'pending')
+        with self.assertRaises(recovery.RecoverySessionError):
+            self.challenge()
+        with self.assertRaises(recovery.RecoverySessionError):
+            self.begin_enrollment()
+        self.finish_enrollment(pending)
+
+    def test_legacy_enroll_cannot_override_pending_and_revocation_invalidates_its_nonce(self):
+        pending = self.begin_enrollment()
+        with self.assertRaises(recovery.RecoverySessionError):
+            self.store.enroll({**self.profile, 'revision': 'e' * 64})
+        self.store.revoke()
+        with self.assertRaises(recovery.RecoverySessionError):
+            self.finish_enrollment(pending)
+        self.assertEqual(self.store.operator_status()['state'], 'revoked')
+        replacement = self.begin_enrollment()
+        self.finish_enrollment(replacement)
+
+    def test_idempotent_enrollment_preserves_generation_but_each_changed_identity_advances_it(self):
+        status = self.store.operator_status()
+        self.store.enroll(self.profile)
+        self.assertEqual(self.store.operator_status(), status)
+        self.store.enroll({**self.profile, 'revision': 'c' * 64})
+        self.assertEqual(self.store.operator_status()['generation'], status['generation'] + 1)
+
+    def description(self, **changes):
+        return {'schema': 'orbis.sentinel-identity-description.v1', **self.profile,
+                'identitySha256': 'c' * 64, 'revision': 'd' * 64, **changes}
+
+    def inspect_enrollment(self, pending, inspector):
+        return self.store.inspect_operator_enrollment(change_token=pending['changeToken'],
+                                                      expected_generation=pending['generation'], inspector=inspector)
+
+    def test_planned_digest_is_selected_by_root_and_inspected_before_atomic_activation(self):
+        pending = self.begin_enrollment()
+        inspector = mock.Mock(return_value=self.description())
+        result = self.inspect_enrollment(pending, inspector)
+        inspector.assert_called_once_with('c' * 64)
+        self.assertEqual(result['state'], 'enrolled')
+        inspector.reset_mock()
+        with self.assertRaises(recovery.RecoverySessionError):
+            self.inspect_enrollment(pending, inspector)
+        inspector.assert_not_called()
+
+    def test_inspector_failure_or_unexpected_proof_never_activates_operator_or_leaks_a_key(self):
+        key = self.prepare_key()
+        self.activate_key(key)
+        emergency = self.key_session(key['recoveryKey'])
+        pending = self.begin_enrollment()
+        with self.assertRaises(RuntimeError):
+            self.inspect_enrollment(pending, mock.Mock(side_effect=RuntimeError('worker unavailable')))
+        for value in (self.description(identitySha256='e' * 64), self.description(passwordHash='untrusted'),
+                      self.description(schema='orbis.sentinel-authentication.v1'), self.description(accountId=True), None):
+            with self.assertRaises(recovery.RecoverySessionError):
+                self.inspect_enrollment(pending, mock.Mock(return_value=value))
+            self.assertEqual(self.store.operator_status()['state'], 'pending')
+            self.assertEqual(self.session(emergency)['principal'], 'recovery-key')
+        self.inspect_enrollment(pending, lambda digest: self.description())
+
+    def test_revocation_during_inspection_cannot_activate_a_superseded_pending_identity(self):
+        pending = self.begin_enrollment()
+        def inspector(digest):
+            self.store.revoke()
+            return self.description()
+        with self.assertRaises(recovery.RecoverySessionError):
+            self.inspect_enrollment(pending, inspector)
+        self.assertEqual(self.store.operator_status()['state'], 'revoked')
+
     def test_password_session_csrf_logout_and_no_host_authority(self):
         result = self.complete()
         self.assertEqual(self.session(result)['accountId'], 1)

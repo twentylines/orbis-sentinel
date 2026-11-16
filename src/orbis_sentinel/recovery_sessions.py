@@ -159,6 +159,8 @@ class RecoverySessions:
                 CREATE TABLE IF NOT EXISTS attempts (id INTEGER PRIMARY KEY CHECK(id=1), start INTEGER NOT NULL, count INTEGER NOT NULL);
                 CREATE TABLE IF NOT EXISTS recovery_keys (revision TEXT PRIMARY KEY, digest TEXT NOT NULL, origin TEXT NOT NULL, active INTEGER NOT NULL, previous_revision TEXT, created INTEGER NOT NULL);
                 CREATE TABLE IF NOT EXISTS key_attempts (id INTEGER PRIMARY KEY CHECK(id=1), start INTEGER NOT NULL, count INTEGER NOT NULL);
+                CREATE TABLE IF NOT EXISTS operator_enrollment (id INTEGER PRIMARY KEY CHECK(id=1), generation INTEGER NOT NULL, nonce TEXT, target TEXT, origin TEXT);
+                INSERT OR IGNORE INTO operator_enrollment VALUES (1,0,NULL,NULL,NULL);
             ''')
             # No pre-restart browser authority survives a new owner instance.
             self._transaction(lambda: (self._db.execute('DELETE FROM challenges'), self._db.execute('DELETE FROM sessions')))
@@ -225,34 +227,149 @@ class RecoverySessions:
             _fail()
         return _enrollment(json.loads(rows[0]['profile']))
 
+    def _write_identity(self, profile):
+        encoded = json.dumps(profile, sort_keys=True, separators=(',', ':'))
+        key = self._db.execute('SELECT origin FROM recovery_keys WHERE active=1').fetchone()
+        if key and key['origin'] != profile['origin']:
+            _fail()
+        known = self._db.execute('SELECT profile, active FROM identities WHERE revision=?', (profile['revision'],)).fetchone()
+        if known:
+            if known['profile'] != encoded or known['active'] != 1:
+                _fail()
+            return False
+        if self._db.execute('SELECT count(*) FROM identities').fetchone()[0] >= 1024:
+            _fail()
+        self._db.execute('UPDATE identities SET active=0')
+        self._db.execute('INSERT INTO identities VALUES (?,?,1)', (profile['revision'], encoded))
+        for table in ('challenges', 'sessions'):
+            self._db.execute('DELETE FROM ' + table + " WHERE method!='recovery-key'")
+        self._db.executemany('INSERT INTO counters VALUES (?,?) ON CONFLICT(credential) DO UPDATE SET counter=MAX(counter,excluded.counter)',
+                             profile['credentials'].items())
+        return True
+
+    def _operator_enrollment(self):
+        row = self._db.execute('SELECT * FROM operator_enrollment WHERE id=1').fetchone()
+        if row is None or not _integer(row['generation'], 0, 9_007_199_254_740_990):
+            _fail()
+        if row['nonce'] is None:
+            if row['target'] is not None or row['origin'] is not None:
+                _fail()
+        elif (type(row['nonce']) is not str or not _HEX.fullmatch(row['nonce'])
+              or type(row['target']) is not str or not _HEX.fullmatch(row['target'])):
+            _fail()
+        else:
+            _origin(row['origin'])
+        return row
+
+    def _operator_status(self):
+        state = self._operator_enrollment()
+        rows = self._db.execute('SELECT profile FROM identities WHERE active=1').fetchall()
+        if len(rows) > 1 or (state['nonce'] is not None and rows):
+            _fail()
+        current = _enrollment(json.loads(rows[0]['profile'])) if rows else None
+        history = self._db.execute('SELECT count(*) FROM identities').fetchone()[0]
+        return {'generation': state['generation'], 'revision': current['revision'] if current else None,
+                'state': 'pending' if state['nonce'] is not None else 'enrolled' if current else
+                         'revoked' if history or state['generation'] else 'never-enrolled'}
+
+    def operator_status(self):
+        """Privileged enrollment status; unavailable storage never means unenrolled."""
+        return self._transaction(self._operator_status)
+
     def enroll(self, profile):
         profile = _enrollment(profile)
-        encoded = json.dumps(profile, sort_keys=True, separators=(',', ':'))
         def write():
-            key = self._db.execute('SELECT origin FROM recovery_keys WHERE active=1').fetchone()
-            if key and key['origin'] != profile['origin']:
+            if self._operator_enrollment()['nonce'] is not None:
                 _fail()
-            known = self._db.execute('SELECT profile, active FROM identities WHERE revision=?', (profile['revision'],)).fetchone()
-            if known:
-                if known['profile'] != encoded or known['active'] != 1:
-                    _fail()
-                return
-            if self._db.execute('SELECT count(*) FROM identities').fetchone()[0] >= 1024:
-                _fail()
-            self._db.execute('UPDATE identities SET active=0')
-            self._db.execute('INSERT INTO identities VALUES (?,?,1)', (profile['revision'], encoded))
-            for table in ('challenges', 'sessions'):
-                self._db.execute('DELETE FROM ' + table + " WHERE method!='recovery-key'")
-            self._db.executemany('INSERT INTO counters VALUES (?,?) ON CONFLICT(credential) DO UPDATE SET counter=MAX(counter,excluded.counter)',
-                                 profile['credentials'].items())
+            if self._write_identity(profile):
+                self._db.execute('UPDATE operator_enrollment SET generation=generation+1 WHERE id=1')
         self._transaction(write)
 
     def revoke(self):
         def write():
+            self._operator_enrollment()
             self._db.execute('UPDATE identities SET active=0')
             self._db.execute("DELETE FROM challenges WHERE method!='recovery-key'")
             self._db.execute("DELETE FROM sessions WHERE method!='recovery-key'")
+            self._db.execute('UPDATE operator_enrollment SET generation=generation+1,nonce=NULL,target=NULL,origin=NULL WHERE id=1')
         self._transaction(write)
+
+    def begin_operator_enrollment(self, *, expected_generation, expected_revision, identity_sha256, origin):
+        """Revoke operator authority before a supervised credential mutation.
+
+        Callers must serialize actual account/passkey writers and bind the planned
+        protected profile. This nonce fences enrollment, not external DB writes or
+        disruptive workers; it grants no host operation or takeover authority.
+        """
+        if (not _integer(expected_generation) or type(identity_sha256) is not str or not _HEX.fullmatch(identity_sha256)
+                or (expected_revision is not None and (type(expected_revision) is not str or not _HEX.fullmatch(expected_revision)))):
+            _fail()
+        origin = _origin(origin)
+        raw = secrets.token_urlsafe(32)
+        def write():
+            status = self._operator_status()
+            if (status['generation'] != expected_generation or status['revision'] != expected_revision
+                    or status['state'] == 'pending'):
+                _fail()
+            for table in ('identities', 'recovery_keys'):
+                rows = self._db.execute('SELECT ' + ('profile' if table == 'identities' else 'origin') + ' FROM ' + table + ' WHERE active=1').fetchall()
+                for row in rows:
+                    current_origin = _enrollment(json.loads(row['profile']))['origin'] if table == 'identities' else row['origin']
+                    if current_origin != origin:
+                        _fail()
+            self._db.execute('UPDATE identities SET active=0')
+            for table in ('challenges', 'sessions'):
+                self._db.execute('DELETE FROM ' + table + " WHERE method!='recovery-key'")
+            self._db.execute('UPDATE operator_enrollment SET generation=generation+1,nonce=?,target=?,origin=? WHERE id=1',
+                             (_token(raw), identity_sha256, origin))
+            return {'generation': expected_generation + 1, 'changeToken': raw}
+        return self._transaction(write)
+
+    def complete_operator_enrollment(self, profile, *, change_token, expected_generation):
+        """Activate only metadata inspected from the exact planned protected bytes.
+
+        The privileged caller must establish that the corresponding main credential
+        mutation and profile custody are complete; a browser cannot supply proof.
+        """
+        profile = _enrollment(profile)
+        digest = _token(change_token)
+        if not _integer(expected_generation):
+            _fail()
+        def write():
+            state = self._operator_enrollment()
+            if (state['generation'] != expected_generation or state['nonce'] is None
+                    or not secrets.compare_digest(state['nonce'], digest)
+                    or state['target'] != profile['identitySha256'] or state['origin'] != profile['origin']):
+                _fail()
+            self._write_identity(profile)
+            self._db.execute('UPDATE operator_enrollment SET generation=generation+1,nonce=NULL,target=NULL,origin=NULL WHERE id=1')
+            return self._operator_status()
+        return self._transaction(write)
+
+    def inspect_operator_enrollment(self, *, change_token, expected_generation, inspector):
+        """Inspect the planned protected profile before activating its metadata.
+
+        inspector(digest) is a privileged, bounded worker callback with verified
+        cleanup, never a browser response or main application's assertion.
+        """
+        digest = _token(change_token)
+        if not _integer(expected_generation) or not callable(inspector):
+            _fail()
+        with self._mutex:
+            def planned():
+                state = self._operator_enrollment()
+                if (state['generation'] != expected_generation or state['nonce'] is None
+                        or not secrets.compare_digest(state['nonce'], digest)):
+                    _fail()
+                return state['target']
+            target = self._transaction(planned)
+            description = inspector(target)
+            fields = {'schema', 'identitySha256', 'revision', 'accountId', 'origin', 'totpEnabled', 'requireTotpAfterPasskey', 'credentials'}
+            if (type(description) is not dict or set(description) != fields
+                    or description['schema'] != 'orbis.sentinel-identity-description.v1'):
+                _fail()
+            profile = {key: value for key, value in description.items() if key != 'schema'}
+            return self.complete_operator_enrollment(profile, change_token=change_token, expected_generation=expected_generation)
 
     def prepare_recovery_key(self, *, origin, expected_revision):
         """Privileged preparation; return the new 256-bit key exactly once.
