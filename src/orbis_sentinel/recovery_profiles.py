@@ -35,6 +35,10 @@ class PreparedProfile:
     _owner: object
     _metadata: str
 
+    @property
+    def origin(self):
+        return json.loads(self._metadata)['origin']
+
 
 class RecoveryProfiles:
     """Immutable profiles in the supervisor-approved root session directory.
@@ -45,10 +49,12 @@ class RecoveryProfiles:
     establish container/process cleanup before returning, including on failure.
     """
 
-    def __init__(self, store, *, inspect, verify):
-        if not callable(inspect) or not callable(verify):
+    def __init__(self, store, *, inspect, verify, verify_counter=None):
+        if (not callable(inspect) or not callable(verify)
+                or verify_counter is not None and not callable(verify_counter)):
             _fail()
         self._store, self._inspect, self._verify_worker = store, inspect, verify
+        self._verify_counter_worker = verify_counter
         self._fd = None
         self._identity = None
         self._closed = False
@@ -193,20 +199,23 @@ class RecoveryProfiles:
             except Exception:
                 _fail()
 
-    def begin(self, prepared, *, expected_generation, expected_revision):
+    def begin(self, prepared, *, expected_generation, expected_revision, change_token=None, _baseline_proof=None, _writer_proof=None):
         with self._operation():
             try:
                 digest = self._prepared(prepared)
                 metadata = self._run(digest, self._description, durable=True)
                 if json.dumps(metadata, sort_keys=True, separators=(',', ':')) != prepared._metadata:
                     _fail()
-                return self._store.begin_operator_enrollment(expected_generation=expected_generation,
-                                                              expected_revision=expected_revision,
-                                                              identity_sha256=digest, origin=metadata['origin'])
+                arguments = dict(expected_generation=expected_generation, expected_revision=expected_revision,
+                                 identity_sha256=digest, origin=metadata['origin'])
+                if change_token is not None:
+                    return self._store.begin_prepared_operator_enrollment(**arguments, change_token=change_token,
+                        _baseline_proof=_baseline_proof, _writer_proof=_writer_proof)
+                return self._store.begin_operator_enrollment(**arguments)
             except Exception:
                 _fail()
 
-    def complete(self, prepared, *, change_token, expected_generation):
+    def complete(self, prepared, *, change_token, expected_generation, _source_proof=None):
         with self._operation():
             try:
                 digest = self._prepared(prepared)
@@ -218,7 +227,8 @@ class RecoveryProfiles:
                         _fail()
                     return {'schema': 'orbis.sentinel-identity-description.v1', **value}
                 return self._store.inspect_operator_enrollment(change_token=change_token,
-                                                               expected_generation=expected_generation, inspector=inspected)
+                                                               expected_generation=expected_generation, inspector=inspected,
+                                                               _source_proof=_source_proof)
             except Exception:
                 _fail()
 
@@ -227,6 +237,17 @@ class RecoveryProfiles:
         with self._operation():
             try:
                 return self._run(digest, lambda directory, expected: self._verify_worker(directory, expected, challenge, credentials))
+            except Exception:
+                _fail()
+
+    def verify_counter(self, digest, challenge, response):
+        """Counter-only proof is deliberately distinct from recovery sign-in."""
+        with self._operation():
+            try:
+                if self._verify_counter_worker is None:
+                    _fail()
+                return self._run(digest, lambda directory, expected:
+                    self._verify_counter_worker(directory, expected, challenge, {'response': response}))
             except Exception:
                 _fail()
 

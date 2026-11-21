@@ -8,7 +8,8 @@ import time
 import unittest
 from unittest.mock import patch
 
-from orbis_sentinel.observer import ObserverClient, ObserverCollector, validate_progress, validate_capture, _observer_worker
+from orbis_sentinel.observer import ObserverClient, ObserverCollector, validate_progress, validate_capture, validate_component, _observer_worker, _component_worker
+from orbis_sentinel.status import ComponentStatus
 
 
 POINT = "12345678-1234-4123-8123-123456789abc"
@@ -66,6 +67,14 @@ class ValidationTests(unittest.TestCase):
         for value in ("relative", "/" + "a" * 108, "/a\0b"):
             with self.assertRaises(ValueError): ObserverClient(value)
         with self.assertRaises(ValueError): ObserverClient("/run/observer.sock", group_id=True)
+
+    def test_component_observation_rejects_extra_fields_and_remote_update_claims(self):
+        good = {'installedVersion': '0.8.8', 'availableVersion': None, 'state': 'healthy'}
+        self.assertEqual(validate_component(good), ComponentStatus('0.8.8', None, 'healthy'))
+        for field, bad in (('installedVersion', '0.8.8\n'), ('installedVersion', True), ('state', 'running'),
+                           ('availableVersion', '0.8.9'), ('private', 'hidden')):
+            with self.subTest(field=field), self.assertRaises((TypeError, ValueError)):
+                validate_component({**good, field: bad})
 
 
 class ClientTests(unittest.TestCase):
@@ -148,6 +157,22 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(self.calls, ["/v2/capture-capability"])
         self.assertEqual(self.client.read(), progress())
 
+    def test_component_negotiates_its_own_capability_and_fixed_read_only_route(self):
+        capability = {'schema': 'orbis.sentinel-observer.component.v1', 'protocolVersion': 1, 'kind': 'core-component-status'}
+        component = {'installedVersion': '0.8.8', 'availableVersion': None, 'state': 'unavailable'}
+        self.respond = lambda route: capability if route == '/v3/component-capability' else component
+        self.assertEqual(self.client.read_component(), component)
+        self.assertEqual(self.calls, ['/v3/component-capability', '/v3/orbis/status'])
+        self.calls.clear()
+        self.respond = lambda route: {**capability, 'protocolVersion': True}
+        with self.assertRaises(ValueError): self.client.read_component()
+        self.assertEqual(self.calls, ['/v3/component-capability'])
+
+    def test_old_observer_keeps_progress_without_component_support(self):
+        with self.assertRaises(ValueError): self.client.read_component()
+        self.assertEqual(self.calls, ['/v3/component-capability'])
+        self.assertEqual(self.client.read(), progress())
+
     def test_wrong_server_peer_is_refused_before_any_http(self):
         self.peer.stop()
         self.peer = patch.object(self.client, "_peer_uid", return_value=12345)
@@ -178,6 +203,89 @@ class ClientTests(unittest.TestCase):
 
 
 class CollectorTests(unittest.TestCase):
+    def test_component_observation_runs_while_progress_is_stalled(self):
+        class Finished(BaseException):
+            pass
+        entered, release = threading.Event(), threading.Event()
+        errors = []
+        class Client:
+            def __init__(self, path):
+                pass
+            def read(self, *, deadline):
+                entered.set()
+                if not release.wait(2):
+                    raise AssertionError('progress fixture was not released')
+                raise ValueError('update progress unavailable')
+            def read_component(self, *, deadline):
+                return {'installedVersion': '0.8.8', 'availableVersion': None, 'state': 'unavailable'}
+        output, receiver = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+        component_output, component_receiver = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+        self.addCleanup(receiver.close)
+        self.addCleanup(component_receiver.close)
+        receiver.settimeout(1)
+        component_receiver.settimeout(1)
+        def run_progress():
+            try:
+                _observer_worker(output, ('/run/orbis-observer/progress.sock',), 1)
+            except Finished:
+                pass
+            except BaseException as error:
+                errors.append(error)
+        thread = threading.Thread(target=run_progress)
+        with patch('orbis_sentinel.observer.ObserverClient', Client), \
+                patch('orbis_sentinel.observer.time.sleep', side_effect=Finished):
+            thread.start()
+            try:
+                self.assertTrue(entered.wait(1))
+                with self.assertRaises(Finished):
+                    _component_worker(component_output, ('/run/orbis-observer/progress.sock',), 1)
+                sample = json.loads(component_receiver.recv(65536))['sample']
+                self.assertEqual(sample['component']['state'], 'unavailable')
+                self.assertTrue(thread.is_alive())
+            finally:
+                release.set()
+                thread.join(2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        sample = json.loads(receiver.recv(65536))['sample']
+        self.assertFalse(sample['available'])
+        self.assertIsNone(sample['progress'])
+        self.assertEqual(output.fileno(), -1)
+        self.assertEqual(component_output.fileno(), -1)
+
+    def test_failed_component_sample_clears_prior_success(self):
+        class Finished(BaseException):
+            pass
+        class Client:
+            def __init__(self, path):
+                pass
+            def read_component(self, *, deadline):
+                raise ValueError('unavailable')
+        output, receiver = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+        self.addCleanup(receiver.close)
+        receiver.settimeout(1)
+        with patch('orbis_sentinel.observer.ObserverClient', Client), \
+                patch('orbis_sentinel.observer.time.sleep', side_effect=Finished), self.assertRaises(Finished):
+            _component_worker(output, ('/run/orbis-observer/progress.sock',), 1)
+        self.assertIsNone(json.loads(receiver.recv(65536))['sample']['component'])
+        self.assertEqual(output.fileno(), -1)
+
+    def test_failed_second_worker_start_releases_both_owned_collectors(self):
+        collector = ObserverCollector('/run/orbis-observer/progress.sock')
+        with patch('orbis_sentinel.observer.TelemetryCollector.start', side_effect=[None, RuntimeError('spawn failed')]), \
+                self.assertRaises(RuntimeError):
+            collector.start()
+        self.assertTrue(collector.closed)
+        self.assertTrue(collector.components.closed)
+
+    def test_component_close_failure_still_closes_progress_owner(self):
+        collector = ObserverCollector('/run/orbis-observer/progress.sock')
+        with patch.object(collector.components, 'close', side_effect=RuntimeError('close failed')), \
+                self.assertRaises(RuntimeError):
+            collector.close()
+        self.assertTrue(collector.closed)
+        collector.components.close()
+
     def test_shared_worker_collects_on_demand_with_one_deadline_and_expires_interest(self):
         class Finished(BaseException):
             pass
@@ -194,6 +302,9 @@ class CollectorTests(unittest.TestCase):
                     raise Finished
                 calls.append(('update', deadline))
                 return progress()
+            def read_component(self, *, deadline):
+                calls.append(('component', deadline))
+                return {'installedVersion': '0.8.8', 'availableVersion': None, 'state': 'healthy'}
         output, receiver = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
         self.addCleanup(receiver.close)
         receiver.settimeout(1)
@@ -233,6 +344,17 @@ class CollectorTests(unittest.TestCase):
             expected = state == "ready" and available
             self.assertEqual(result["available"], expected)
             self.assertEqual(result["progress"], progress() if expected else None)
+
+    def test_component_drops_stale_success_without_inferring_controller_failure(self):
+        collector = ObserverCollector('/run/orbis-observer/progress.sock')
+        self.addCleanup(collector.close)
+        good = {'installedVersion': '0.8.8', 'availableVersion': None, 'state': 'healthy'}
+        for state, sample in (('ready', good), ('stale', good), ('unavailable', good), ('ready', None),
+                              ('ready', {**good, 'private': 'hidden'})):
+            with self.subTest(state=state, sample=sample), patch('orbis_sentinel.observer.TelemetryCollector.snapshot',
+                    return_value={'state': state, 'ageMs': 123, 'sample': {'component': sample}}):
+                expected = ComponentStatus('0.8.8', None, 'healthy') if state == 'ready' and sample == good else ComponentStatus(None, None, 'unknown')
+                self.assertEqual(collector.component_snapshot(), expected)
 
 
 if __name__ == "__main__":

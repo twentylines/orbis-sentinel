@@ -8,12 +8,15 @@ import copy
 import math
 import os
 from pathlib import Path
+import re
 import sys
 import threading
 import time
 
 _LIMIT = 1024 * 1024
 _COUNTER_MAX = 2 ** 64 - 1
+_SAFE_INTEGER = 2 ** 53 - 1
+_MAX_LOGICAL_CPUS = 256
 
 
 def _finite(value):
@@ -34,6 +37,16 @@ def _read(path):
         return None
 
 
+def _cpu_fields(fields):
+    selected = fields[:8]
+    if len(selected) < 4 or any(not re.fullmatch(r"[0-9]{1,20}", field) for field in selected):
+        return None
+    values = tuple(int(value) for value in selected)
+    if any(value > _COUNTER_MAX for value in values):
+        return None
+    return values, sum(values[3:5])
+
+
 def _cpu(text):
     try:
         fields = text.splitlines()[0].split()
@@ -48,6 +61,77 @@ def _cpu(text):
         return tuple(values), idle
     except (AttributeError, IndexError, ValueError):
         return None
+
+
+def _cpu_percent(before, current):
+    if before is None or current is None:
+        return None
+    previous, previous_idle = before
+    values, current_idle = current
+    elapsed = sum(values) - sum(previous)
+    idle = current_idle - previous_idle
+    if len(values) == len(previous) and all(a >= b for a, b in zip(values, previous)) and elapsed > 0 and 0 <= idle <= elapsed:
+        return 100.0 * ((elapsed - idle) / elapsed)
+    return None
+
+
+def _logical_cpus(text):
+    if text is None:
+        return {}
+    result = {}
+    for line in text.splitlines():
+        fields = line.split()
+        if not fields or not re.fullmatch(r"cpu[0-9]+", fields[0]):
+            continue
+        if len(fields[0]) > 10:
+            return {}
+        index = int(fields[0][3:])
+        counter = _cpu_fields(fields[1:])
+        if counter is None or index in result or len(result) >= _MAX_LOGICAL_CPUS:
+            return {}
+        result[index] = counter
+    return result
+
+
+def _swap(text):
+    if text is None:
+        return None
+    values = {}
+    for line in text.splitlines():
+        parts = line.split()
+        if not parts or parts[0] not in ("SwapTotal:", "SwapFree:"):
+            continue
+        if len(parts) != 3 or parts[2] != "kB" or parts[0] in values or not re.fullmatch(r"[0-9]{1,16}", parts[1]):
+            return None
+        values[parts[0]] = int(parts[1]) * 1024
+    total, free = values.get("SwapTotal:"), values.get("SwapFree:")
+    return ({"swapTotalBytes": total, "swapFreeBytes": free}
+            if total is not None and free is not None and 0 <= free <= total <= _SAFE_INTEGER else None)
+
+
+def _cpu_information(text):
+    if text is None:
+        return None
+    model_line = re.search(r"^(?:model name|Processor)[ \t]*:[ \t]*(\S[^\r\n]*)", text, re.MULTILINE)
+    labels = re.findall(r"^cpu MHz[ \t]*:[ \t]*([^\r\n]*)", text, re.MULTILINE)
+    if not model_line or not labels:
+        return None
+    model = " ".join(model_line[1].split())[:200]
+    if (not model or any(ord(character) < 32 or ord(character) == 127 for character in model)
+            or any(not re.fullmatch(r"[0-9]{1,6}(?:\.[0-9]{1,12})?", value.strip()) for value in labels)):
+        return None
+    clocks = [float(value) for value in labels]
+    if len(clocks) > _MAX_LOGICAL_CPUS or any(not 0 < value <= 100_000 for value in clocks):
+        return None
+    return {"model": model, "reportedClockGHz": sum(clocks) / len(clocks) / 1000}
+
+
+def _uptime(text):
+    raw = (text or "").split()
+    if not raw or not re.fullmatch(r"[0-9]{1,16}(?:\.[0-9]{1,12})?", raw[0]):
+        return None
+    value = float(raw[0])
+    return value if value <= _SAFE_INTEGER else None
 
 
 def _memory(text):
@@ -114,42 +198,67 @@ class TelemetrySampler:
         self.linux = (sys.platform if platform is None else platform).startswith("linux")
         self.lock = threading.Lock()
         self.last_time = self.cache = self.cpu_base = self.net_base = None
+        self.system_cache = self.system_cpu_base = None
+        self.logical_base = {}
 
     def sample(self):
+        return self.samples()[0]
+
+    def samples(self):
+        """Return paired coarse and complete whole-host snapshots of one observation."""
         with self.lock:
             now = self.clock()
             if not _finite(now):
                 raise ValueError("monotonic clock must return a finite number")
             if self.last_time is not None and now >= self.last_time and now - self.last_time < self.interval:
-                return copy.deepcopy(self.cache)
+                return copy.deepcopy((self.cache, self.system_cache))
             # A backwards clock cannot produce a valid interval against old baselines.
             if self.last_time is not None and now < self.last_time:
                 self.cpu_base = self.net_base = None
             wall_time = self.wall_time()
             if not _finite(wall_time) or not 0 <= wall_time <= (2 ** 53 - 1) / 1000:
                 raise ValueError("wall clock must return a valid timestamp")
-            result = self._collect(now)
+            result, system = self._collect(now)
             result["sampledAt"] = int(wall_time * 1000)
-            self.last_time, self.cache = now, result
-            return copy.deepcopy(result)
+            if system is not None:
+                system["sampledAt"] = result["sampledAt"]
+            self.last_time, self.cache, self.system_cache = now, result, system
+            return copy.deepcopy((result, system))
+
+    def _host_system(self, now, stat, meminfo, current, memory):
+        logical = _logical_cpus(stat)
+        previous, self.logical_base = self.logical_base, logical
+        before, self.system_cpu_base = self.system_cpu_base, current
+        aggregate = _cpu_percent(before, current)
+        if (self.last_time is None or not 0 < now - self.last_time <= 30
+                or not logical or logical.keys() != previous.keys() or aggregate is None or not memory
+                or memory["totalBytes"] > _SAFE_INTEGER):
+            return None
+        cores = [_cpu_percent(previous[index], logical[index]) for index in sorted(logical)]
+        if any(value is None for value in cores):
+            return None
+        swap = _swap(meminfo)
+        info = _cpu_information(_read(self.proc / "cpuinfo"))
+        uptime = _uptime(_read(self.proc / "uptime"))
+        if swap is None or info is None or uptime is None:
+            return None
+        return {"cpu": {**info, "totalPercent": aggregate, "perCorePercent": cores, "uptimeSeconds": uptime},
+                "memory": {**memory, **swap}}
 
     def _collect(self, now):
         result = {"schema": "orbis-sentinel.telemetry.v1", "cpuPercent": None,
                   "memory": None, "network": None, "filesystems": {path: None for path in self.paths},
                   "thermal": None, "perAppCpu": None, "gpu": None}
         if not self.linux:
-            return result
-        current = _cpu(_read(self.proc / "stat"))
+            return result, None
+        stat = _read(self.proc / "stat")
+        current = _cpu(stat)
         if current is not None:
-            if self.cpu_base is not None:
-                previous, previous_idle = self.cpu_base
-                values, current_idle = current
-                total = sum(values) - sum(previous)
-                idle = current_idle - previous_idle
-                if len(values) == len(previous) and all(a >= b for a, b in zip(values, previous)) and total > 0 and 0 <= idle <= total:
-                    result["cpuPercent"] = 100.0 * ((total - idle) / total)
+            result["cpuPercent"] = _cpu_percent(self.cpu_base, current)
             self.cpu_base = current
-        result["memory"] = _memory(_read(self.proc / "meminfo"))
+        meminfo = _read(self.proc / "meminfo")
+        result["memory"] = _memory(meminfo)
+        system = self._host_system(now, stat, meminfo, current, result["memory"])
         network = _network(_read(self.proc / "net/dev"))
         if network is not None:
             result["network"] = {}
@@ -196,4 +305,4 @@ class TelemetrySampler:
                         result["thermal"][zone] = None
             except OSError:
                 pass
-        return result
+        return result, system

@@ -20,6 +20,27 @@ MAX_FILE_BYTES = 16 * 1024 * 1024
 MAX_TOTAL_BYTES = 64 * 1024 * 1024
 MAX_FILES = 512
 ENTRYPOINTS = ("orbis-sentinel", "orbis-sentinel-capture", "orbis-sentinel-verify")
+RECOVERY_HTTPS_MEMBERS = {
+    "src/orbis_sentinel/recovery_https_edge.py",
+    "src/orbis_sentinel/recovery_https_install.py",
+    "packaging/systemd/orbis-sentinel-recovery-https.socket",
+    "packaging/systemd/orbis-sentinel-recovery-https.service",
+}
+
+RECOVERY_BACKEND_COMMAND = "--prepare-recovery-listener-backend"
+RECOVERY_BACKEND_ENTRY = "src/orbis_sentinel/recovery_backend_tls.py"
+RECOVERY_BACKEND_MEMBERS = RECOVERY_HTTPS_MEMBERS | {
+    RECOVERY_BACKEND_ENTRY,
+    "src/orbis_sentinel/recovery_listener_install.py",
+    "src/orbis_sentinel/recovery_cli.py",
+    "src/orbis_sentinel/recovery_runtime.py",
+    "src/orbis_sentinel/recovery_gateway.py",
+    "src/orbis_sentinel/recovery_worker_provision.py",
+    "packaging/systemd/orbis-sentinel-recovery.service",
+}
+
+def advertises_recovery_https(tree: ast.AST) -> bool:
+    return any(isinstance(node, ast.Constant) and node.value == "--recovery-https-edge" for node in ast.walk(tree))
 
 
 def release_files(source: Path) -> list[Path]:
@@ -50,6 +71,12 @@ def release_files(source: Path) -> list[Path]:
     required = ("src/orbis_sentinel/__init__.py", "packaging/systemd/orbis-sentinel.service", "packaging/systemd/orbis-sentinel.socket")
     if any(source / name not in files for name in required):
         raise ValueError("Release is missing its version or service contract")
+    members = {path.relative_to(source).as_posix() for path in files}
+    edge = members & RECOVERY_HTTPS_MEMBERS
+    if edge and edge != RECOVERY_HTTPS_MEMBERS:
+        raise ValueError("Release has an incomplete recovery HTTPS contract")
+    if RECOVERY_BACKEND_ENTRY in members and not RECOVERY_BACKEND_MEMBERS <= members:
+        raise ValueError("Release has an incomplete private recovery contract")
     return files
 
 
@@ -98,7 +125,13 @@ def build_release(source: Path, output: Path) -> dict[str, object]:
         if total > MAX_TOTAL_BYTES:
             raise ValueError("Release exceeds its size bound")
         if path.suffix == ".py" or relative.startswith("bin/"):
-            ast.parse(data, filename=relative, feature_version=(3, 10))
+            tree = ast.parse(data, filename=relative, feature_version=(3, 10))
+            if relative == "src/orbis_sentinel/runtime.py":
+                if advertises_recovery_https(tree) and any(source/name not in paths for name in RECOVERY_HTTPS_MEMBERS):
+                    raise ValueError("Release runtime requires the recovery HTTPS contract")
+                if (any(isinstance(node,ast.Constant) and node.value == RECOVERY_BACKEND_COMMAND for node in ast.walk(tree))
+                        and any(source/name not in paths for name in RECOVERY_BACKEND_MEMBERS)):
+                    raise ValueError("Release runtime requires the private recovery contract")
         payload[relative] = data
         identities[path] = identity
     version = component_version(payload["src/orbis_sentinel/__init__.py"])

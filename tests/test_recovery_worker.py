@@ -14,6 +14,12 @@ from orbis_sentinel import recovery_worker as worker
 IMAGE = 'sha256:' + 'a' * 64
 CID = 'b' * 64
 DIGEST = 'c' * 64
+CAPABILITY = {'schema':'orbis.sentinel-authentication-worker.v1','version':1,'methods':['password','passkey'],
+              'role':'operator','maxIdentityBytes':65536,'maxRequestBytes':32768,'deadlineMs':10000,
+              'databaseRequired':False,'mutations':'none','grantsAuthority':False,
+              'identityContentProof':'orbis.sentinel-identity-content.v1',
+              'effectiveIdentityContentProof':'orbis.sentinel-effective-identity-content.v1',
+              'passkeyCounterProof':'orbis.sentinel-passkey-counter.v1'}
 
 
 class DockerFixture:
@@ -81,6 +87,28 @@ class RecoveryWorkerTests(unittest.TestCase):
     def receipt(self):
         return Path(self.temp.name) / 'credential-worker' / 'state.json'
 
+    def test_capability_uses_actual_owned_worker_without_identity_mount_or_credentials(self):
+        self.runner.result=json.dumps(CAPABILITY).encode()
+        self.assertEqual(self.adapter.capability(),CAPABILITY)
+        create=next(args for args,_ in self.runner.calls if args[0]=='create')
+        self.assertEqual(create[-2:],[worker._SCRIPT,'--capability'])
+        self.assertNotIn('--mount',create);self.assertNotIn(DIGEST,create)
+        start=next(options for args,options in self.runner.calls if args[0]=='start')
+        self.assertEqual(start['body'],b'')
+        self.assertFalse(self.runner.present);self.assertEqual(json.loads(self.receipt().read_bytes())['phase'],'clean')
+
+    def test_incomplete_old_bool_or_extra_capability_is_cleaned_and_refused(self):
+        for changes in ({'version':True},{'version':1.0},{'passkeyCounterProof':None},
+                        {'effectiveIdentityContentProof':'old'},{'grantsAuthority':True},{'extra':True}):
+            self.runner.result=json.dumps(dict(CAPABILITY,**changes)).encode()
+            with self.subTest(changes=changes),self.assertRaises(worker.RecoveryWorkerError):self.adapter.capability()
+            self.assertFalse(self.runner.present);self.assertEqual(json.loads(self.receipt().read_bytes())['phase'],'clean')
+
+    def test_capability_cleanup_failure_never_returns_qualification(self):
+        self.runner.result=json.dumps(CAPABILITY).encode();self.runner.failure='rm'
+        with self.assertRaises(worker.RecoveryWorkerCleanupRequired):self.adapter.capability()
+        self.assertEqual(json.loads(self.receipt().read_bytes())['phase'],'created')
+
     def test_credentials_only_use_stdin_and_result_requires_verified_cleanup(self):
         challenge = secrets.token_urlsafe(32)
         credentials = {'method': 'password', 'password': 'synthetic-secret-must-not-escape'}
@@ -104,6 +132,16 @@ class RecoveryWorkerTests(unittest.TestCase):
         start = next(options for args, options in self.runner.calls if args[0] == 'start')
         self.assertEqual(start['body'], b'')
         self.assertEqual(start['limit'], 32768)
+
+    def test_content_proof_uses_same_bounded_owned_worker_and_cleanup(self):
+        self.assertEqual(self.adapter.inspect_content(self.directory, DIGEST), {'syntheticResult': True})
+        create = next(args for args, _ in self.runner.calls if args[0] == 'create')
+        self.assertEqual(create[-2:], ['--describe-content', DIGEST])
+        start = next(options for args, options in self.runner.calls if args[0] == 'start')
+        self.assertEqual(start['body'], b'')
+        self.assertEqual(start['limit'], 32768)
+        self.assertFalse(self.runner.present)
+        self.assertEqual(json.loads(self.receipt().read_text())['phase'], 'clean')
 
     def test_ambiguous_create_is_durable_hold_even_after_container_disappears(self):
         self.runner.failure = 'create'

@@ -25,6 +25,18 @@ MAX_FILES = 512
 MAX_ENTRIES = 8192
 MAX_EXPANDED_BYTES = MAX_TOTAL_BYTES + MAX_ENTRIES * 512 + MAX_MANIFEST_BYTES + 10240
 ENTRYPOINTS = ("orbis-sentinel", "orbis-sentinel-capture", "orbis-sentinel-verify")
+RECOVERY_HTTPS_COMMAND = "--recovery-https-edge"
+RECOVERY_BACKEND_COMMAND = "--prepare-recovery-listener-backend"
+RECOVERY_BACKEND_ENTRY = "src/orbis_sentinel/recovery_backend_tls.py"
+RECOVERY_BACKEND_MEMBERS = {
+    RECOVERY_BACKEND_ENTRY,
+    "src/orbis_sentinel/recovery_listener_install.py",
+    "src/orbis_sentinel/recovery_cli.py",
+    "src/orbis_sentinel/recovery_runtime.py",
+    "src/orbis_sentinel/recovery_gateway.py",
+    "src/orbis_sentinel/recovery_worker_provision.py",
+    "packaging/systemd/orbis-sentinel-recovery.service",
+}
 VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9]+(?:[.-][A-Za-z0-9]+)*)?")
 SHA256 = re.compile(r"[a-f0-9]{64}")
 DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
@@ -192,6 +204,7 @@ def _scan(snapshot, sink=None):
     snapshot.seek(0)
     files, directories, seen = {}, set(), set()
     manifest, initializer = None, None
+    runtime_commands = frozenset()
     total = 0
     with gzip.GzipFile(fileobj=snapshot, mode="rb") as compressed:
         with tarfile.open(fileobj=_BoundedReader(compressed), mode="r|") as archive:
@@ -226,6 +239,13 @@ def _scan(snapshot, sink=None):
                     if len(data) > 64 * 1024:
                         raise StageError("Version declaration exceeds its size bound")
                     initializer = data
+                if name == "src/orbis_sentinel/runtime.py":
+                    if len(data) > 262144:
+                        raise StageError("Runtime declaration exceeds its size bound")
+                    known = {RECOVERY_HTTPS_COMMAND,RECOVERY_BACKEND_COMMAND}
+                    runtime_commands = frozenset(node.value for node in ast.walk(ast.parse(data))
+                                                 if isinstance(node,ast.Constant) and isinstance(node.value,str)
+                                                 and node.value in known)
                 if sink:
                     sink(name, data, entry.mode)
             tail = 0
@@ -238,10 +258,10 @@ def _scan(snapshot, sink=None):
     parents = {parent.as_posix() for name in files for parent in PurePosixPath(name).parents if parent != PurePosixPath(".")}
     if not directories.issubset(parents):
         raise StageError("Archive contains an unused directory")
-    return files, manifest, initializer
+    return files, manifest, initializer, runtime_commands
 
 
-def _manifest(files, value, initializer, version):
+def _manifest(files, value, initializer, version, *, runtime_https=False):
     if not isinstance(value, dict) or set(value) != {"format", "component", "version", "python", "files"}:
         raise StageError("Invalid release manifest")
     if type(value["format"]) is not int or value["format"] != 1 or value["component"] != "orbis-sentinel" or value["python"] != ">=3.10" or value["version"] != version:
@@ -260,6 +280,19 @@ def _manifest(files, value, initializer, version):
     required = {"LICENSE", "src/orbis_sentinel/__init__.py", "packaging/systemd/orbis-sentinel.service", "packaging/systemd/orbis-sentinel.socket", *(f"bin/{name}" for name in ENTRYPOINTS)}
     if not required.issubset(declared) or initializer is None:
         raise StageError("Release is missing required files")
+    edge = {
+        "src/orbis_sentinel/recovery_https_edge.py",
+        "src/orbis_sentinel/recovery_https_install.py",
+        "packaging/systemd/orbis-sentinel-recovery-https.socket",
+        "packaging/systemd/orbis-sentinel-recovery-https.service",
+    }
+    commands = runtime_https if isinstance(runtime_https,frozenset) else (
+        {RECOVERY_HTTPS_COMMAND} if runtime_https else set())
+    if (RECOVERY_HTTPS_COMMAND in commands or edge.intersection(declared)) and not edge.issubset(declared):
+        raise StageError("Release has an incomplete recovery HTTPS contract")
+    if ((RECOVERY_BACKEND_COMMAND in commands or RECOVERY_BACKEND_ENTRY in declared)
+            and not (edge | RECOVERY_BACKEND_MEMBERS).issubset(declared)):
+        raise StageError("Release has an incomplete private recovery contract")
     versions = [node.value.value for node in ast.parse(initializer).body if isinstance(node, ast.Assign) and any(isinstance(target, ast.Name) and target.id == "__version__" for target in node.targets) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)]
     if versions != [version]:
         raise StageError("Payload version does not match the manifest")
@@ -372,7 +405,7 @@ def stage_release(artifact: Path, releases: Path, *, sha256: str, version: str, 
             # Parsing and extraction use this anonymous snapshot, never a reopened source path.
             _snapshot_archive(artifact, frozen, sha256)
             first = _scan(frozen)
-            _manifest(*first, version)
+            _manifest(*first[:3], version, runtime_https=first[3])
             if existing is not None:
                 retained = os.open(version, DIRECTORY_FLAGS, dir_fd=parent.fd)
                 try:

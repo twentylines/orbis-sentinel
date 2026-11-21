@@ -11,12 +11,70 @@ import struct
 import time
 
 from .collector import TelemetryCollector
+from .status import ComponentStatus
 
 _SAFE = 2 ** 53 - 1
 _ID = re.compile(r"[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}", re.ASCII)
 _TAG = re.compile(r"v[0-9]+\.[0-9]+\.[0-9]+(?:[-.][0-9A-Za-z.-]+)?", re.ASCII)
 _CAPABILITY = {"schema": "orbis.sentinel-observer.v1", "protocolVersion": 1, "kind": "core-update-progress"}
 _CAPTURE_CAPABILITY = {"schema": "orbis.sentinel-observer.capture.v1", "protocolVersion": 1, "kind": "core-capture-progress"}
+_COMPONENT_CAPABILITY = {"schema": "orbis.sentinel-observer.component.v1", "protocolVersion": 1, "kind": "core-component-status"}
+
+
+HANDOFF_SCHEMA = "orbis-sentinel.handoff-status.v1"
+HANDOFF_MAX_AGE_MS = 5000
+_HANDOFF_STATES = ("accepted", "stopping", "held", "returning", "complete", "attention")
+_HASH = re.compile(r"[a-f0-9]{64}", re.ASCII)
+_HANDOFF_ROUTE = "/v4/controller-handoff/status"
+
+
+def validate_handoff(value):
+    if (type(value) is not dict or set(value) != {"version", "handoff"}
+            or type(value["version"]) is not int or value["version"] != 1):
+        raise ValueError("Handoff status is unavailable")
+    handoff = value["handoff"]
+    if handoff is None:
+        return {"version": 1, "handoff": None}
+    if (type(handoff) is not dict or type(handoff.get("state")) is not str
+            or handoff["state"] not in _HANDOFF_STATES
+            or type(handoff.get("planId")) is not str or not _ID.fullmatch(handoff["planId"])):
+        raise ValueError("Handoff status is unavailable")
+    held = handoff["state"] == "held"
+    if set(handoff) != ({"planId", "state", "returnScope"} if held else {"planId", "state"}):
+        raise ValueError("Handoff status is unavailable")
+    public = dict(handoff)
+    if held:
+        scope = handoff["returnScope"]
+        if (type(scope) is not dict or set(scope) != {"planId", "installationId", "handoffSha256"}
+                or scope["planId"] != handoff["planId"]
+                or any(type(scope[key]) is not str or not _HASH.fullmatch(scope[key])
+                       for key in ("installationId", "handoffSha256"))):
+            raise ValueError("Handoff status is unavailable")
+        public["returnScope"] = dict(scope)
+    return {"version": 1, "handoff": public}
+
+
+def unavailable_handoff():
+    return {"schema": HANDOFF_SCHEMA, "status": None, "ageMs": None}
+
+
+def validate_handoff_envelope(value):
+    if (type(value) is not dict or set(value) != {"schema", "status", "ageMs"}
+            or value["schema"] != HANDOFF_SCHEMA):
+        raise ValueError("Handoff status is unavailable")
+    if value["status"] is None:
+        if value["ageMs"] is not None:
+            raise ValueError("Handoff status is unavailable")
+        return unavailable_handoff()
+    if type(value["ageMs"]) is not int or not 0 <= value["ageMs"] <= HANDOFF_MAX_AGE_MS:
+        raise ValueError("Handoff status is unavailable")
+    return {"schema": HANDOFF_SCHEMA, "status": validate_handoff(value["status"]), "ageMs": value["ageMs"]}
+
+
+def validate_component(value):
+    if not _exact(value, {"installedVersion", "availableVersion", "state"}) or value["availableVersion"] is not None:
+        raise ValueError("component observation is unavailable")
+    return ComponentStatus(value["installedVersion"], None, value["state"])
 
 
 def validate_capture(value, point):
@@ -177,6 +235,20 @@ class ObserverClient:
             raise ValueError("capture observer is unavailable")
         return validate_capture(self._exchange("/v2/core-captures/" + point + "/progress", deadline), point)
 
+    def read_component(self, *, deadline=None):
+        deadline = time.monotonic() + 2 if deadline is None else deadline
+        capability = self._exchange("/v3/component-capability", deadline)
+        if capability != _COMPONENT_CAPABILITY or type(capability.get("protocolVersion")) is not int:
+            raise ValueError("component observer is unavailable")
+        value = self._exchange("/v3/orbis/status", deadline)
+        validate_component(value)
+        return value
+
+
+    def read_handoff(self, *, deadline=None):
+        deadline = time.monotonic() + 2 if deadline is None else deadline
+        return validate_handoff(self._exchange(_HANDOFF_ROUTE, deadline))
+
 
 def _observer_worker(output, paths, interval):
     client = ObserverClient(paths[0])
@@ -220,12 +292,91 @@ def _observer_worker(output, paths, interval):
         output.close()
 
 
+def _component_worker(output, paths, interval):
+    client = ObserverClient(paths[0])
+    output.setblocking(False)
+    try:
+        while True:
+            started = time.monotonic()
+            sample = {"schema": "orbis-sentinel.component-sample.v1", "component": None}
+            try:
+                sample["component"] = client.read_component(deadline=started + 2)
+            except (OSError, ValueError, TypeError, OverflowError, RecursionError):
+                pass
+            try:
+                output.send(json.dumps({"observed": started, "sample": sample}, allow_nan=False, separators=(",", ":")).encode())
+            except (OSError, ValueError):
+                pass
+            time.sleep(max(0, interval - (time.monotonic() - started)))
+    finally:
+        output.close()
+
+
+class _ComponentCollector(TelemetryCollector):
+    schema = "orbis-sentinel.component-sample.v1"
+
+    def __init__(self, socket_path):
+        super().__init__((socket_path,), 1.0, max_age=5.0, worker=_component_worker)
+
+
+def _handoff_worker(output, paths, interval):
+    client = ObserverClient(paths[0])
+    output.setblocking(False)
+    try:
+        while True:
+            started = time.monotonic()
+            sample = {"schema": _HandoffCollector.schema, "status": None}
+            try:
+                sample["status"] = client.read_handoff(deadline=started + 2)
+            except (OSError, ValueError, TypeError, OverflowError, RecursionError):
+                pass
+            try:
+                output.send(json.dumps({"observed": started, "sample": sample}, allow_nan=False, separators=(",", ":")).encode())
+            except (OSError, ValueError):
+                pass
+            time.sleep(max(0, interval - (time.monotonic() - started)))
+    finally:
+        output.close()
+
+
+class _HandoffCollector(TelemetryCollector):
+    schema = "orbis-sentinel.handoff-sample.v1"
+
+    def __init__(self, socket_path):
+        super().__init__((socket_path,), 2.0, max_age=HANDOFF_MAX_AGE_MS / 1000, worker=_handoff_worker)
+
+
 class ObserverCollector(TelemetryCollector):
     schema = "orbis-sentinel.progress-sample.v1"
 
     def __init__(self, socket_path):
         checked = ObserverClient(socket_path)
         super().__init__((checked.path,), 1.0, max_age=5.0, worker=_observer_worker)
+        self.components = _ComponentCollector(checked.path)
+        self.handoffs = _HandoffCollector(checked.path)
+
+    def start(self):
+        try:
+            super().start()
+            self.components.start()
+            self.handoffs.start()
+        except BaseException:
+            self.close()
+            raise
+
+    def maintain(self):
+        super().maintain()
+        self.components.maintain()
+        self.handoffs.maintain()
+
+    def close(self):
+        try:
+            self.handoffs.close()
+        finally:
+            try:
+                self.components.close()
+            finally:
+                super().close()
 
     def snapshot(self):
         value = super().snapshot()
@@ -233,6 +384,29 @@ class ObserverCollector(TelemetryCollector):
         available = value["state"] == "ready" and type(sample) is dict and sample.get("available") is True
         return {"schema": "orbis-sentinel.progress.v1", "available": available,
                 "progress": sample["progress"] if available else None, "ageMs": value["ageMs"], "sourceState": value["state"]}
+
+    def component_snapshot(self):
+        # Component observation has its own owned worker and freshness budget.
+        # A stalled update/capture reader cannot consume its next opportunity.
+        value = self.components.snapshot()
+        if value["state"] == "ready" and type(value["sample"]) is dict:
+            try:
+                return validate_component(value["sample"].get("component"))
+            except (ValueError, TypeError):
+                pass
+        return ComponentStatus(None, None, "unknown")
+
+    def handoff_snapshot(self):
+        value = self.handoffs.snapshot()
+        sample = value["sample"]
+        if (value["state"] == "ready" and type(sample) is dict
+                and set(sample) == {"schema", "status"} and sample["schema"] == _HandoffCollector.schema):
+            try:
+                return validate_handoff_envelope(
+                    {"schema": HANDOFF_SCHEMA, "status": sample["status"], "ageMs": value["ageMs"]})
+            except (ValueError, TypeError):
+                pass
+        return unavailable_handoff()
 
     def capture_snapshot(self, point):
         if type(point) is not str or not _ID.fullmatch(point):

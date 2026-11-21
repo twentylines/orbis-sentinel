@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Orbis Sentinel</title>
+    <link rel="stylesheet" href="/sentinel/recovery-assets/recovery.css">
+    <script type="module" src="/sentinel/recovery-assets/recovery.js"></script>
+  </head>
+  <body>
+    <a class="skip" href="#content">Skip to recovery</a>
+    <header class="topbar">
+      <span class="product">Orbis Sentinel</span>
+      <label class="appearance">Appearance
+        <select id="appearance">
+          <option value="system">System</option>
+          <option value="light">Light</option>
+          <option value="dark">Dark</option>
+        </select>
+      </label>
+    </header>
+    <main id="content" tabindex="-1">
+      <section class="panel" id="recovery-panel" aria-labelledby="page-title">
+        <header class="panel-header">
+          <svg class="galaxy" width="56" height="56" viewBox="0 0 64 64" aria-hidden="true" focusable="false">
+            <defs>
+              <path id="arm" pathLength="1" d="M32.19 27C31.93 26.82 31.25 26.2 30.65 25.92C30.06 25.65 29.34 25.44 28.61 25.37C27.87 25.31 27.03 25.34 26.23 25.54C25.42 25.73 24.55 26.05 23.76 26.53C22.97 27.01 22.17 27.64 21.49 28.39C20.81 29.15 20.17 30.07 19.7 31.07C19.23 32.08 18.85 33.24 18.66 34.43C18.48 35.63 18.44 36.95 18.6 38.24C18.77 39.54 19.12 40.91 19.68 42.2C20.23 43.49 20.99 44.81 21.94 45.98C22.89 47.15 24.05 48.28 25.36 49.21C26.67 50.14 28.19 50.96 29.79 51.54C31.39 52.12 33.18 52.54 34.98 52.68C36.78 52.81 38.71 52.74 40.58 52.38C42.45 52.02 44.4 51.4 46.2 50.52C48 49.63 49.8 48.47 51.38 47.08C52.96 45.69 54.47 44.01 55.69 42.17C56.91 40.33 58.2 37.06 58.7 36.03"/>
+            </defs>
+            <g fill="none" stroke="currentColor" stroke-width="3.2" stroke-linecap="round">
+              <use href="#arm"/>
+              <use href="#arm" transform="rotate(120 32 32)"/>
+              <use href="#arm" transform="rotate(240 32 32)"/>
+            </g>
+            <circle cx="32" cy="32" r="3.2" fill="currentColor"/>
+          </svg>
+          <div class="heading">
+            <h1 id="page-title" tabindex="-1">Recovery</h1>
+            <p id="page-description">Sign in to Sentinel.</p>
+          </div>
+          <button type="button" id="sign-out" class="quiet" hidden>Sign out</button>
+        </header>
+        <div class="panel-content">
+          <p id="notice" class="notice" role="status" aria-live="polite">Connecting to Sentinel…</p>
+          <section id="recovery-setup" class="recovery-setup" aria-label="Recovery setup" hidden>
+            <div id="enrollment-steps" hidden>
+              <h2 id="setup-title" tabindex="-1">Set up recovery access</h2>
+              <p>Ask an Orbis operator with root access to finish the protected recovery setup on this host.</p>
+              <ol>
+                <li>Complete the listener setup and stage the existing Orbis operator with the Sentinel bootstrap.</li>
+                <li>Prepare and save the emergency key with <code>--bootstrap prepare-key</code> and <code>--bootstrap save-key</code>.</li>
+                <li>Store the saved key somewhere you can reach while Orbis is offline. Run <code>--bootstrap acknowledge-key</code> and enter the key from that copy when prompted.</li>
+                <li>Complete the reviewed activation on the host, then check sign-in again here.</li>
+              </ol>
+              <details>
+                <summary>Host bootstrap requirements</summary>
+                <p>Use the same protected <code>--bootstrap-operation</code>, <code>--review-sha256</code> and <code>--plan-sha256</code> from the host’s setup receipts. For <code>save-key</code>, use <code>--save-key-to</code> with an absolute file path in an existing root-only directory.</p>
+              </details>
+            </div>
+            <p class="help">Sign-in appears automatically when recovery access is ready.</p>
+          </section>
+          <form id="sign-in" hidden>
+            <fieldset id="credentials">
+              <div id="account-fields">
+              <label for="username">Username</label>
+              <input id="username" name="username" autocomplete="username webauthn" maxlength="254" required>
+              <label for="password">Password</label>
+              <input id="password" name="password" type="password" autocomplete="current-password" required>
+              <div id="totp-field" hidden>
+                <label for="totp">Authenticator code</label>
+                <input id="totp" name="totp" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" aria-describedby="totp-help">
+                <p class="help" id="totp-help">Enter the current six-digit code from your authenticator.</p>
+              </div>
+              </div>
+              <div id="recovery-key-field" hidden>
+                <label for="recovery-key">Recovery key</label>
+                <input id="recovery-key" name="recovery-key" type="password" autocomplete="off" spellcheck="false" autocapitalize="none" maxlength="80" aria-describedby="recovery-key-help">
+                <p class="help" id="recovery-key-help">Use the key you saved when Sentinel was enrolled. Orbis can be offline.</p>
+              </div>
+              <div class="form-actions">
+                <button type="submit" id="submit">Sign in</button>
+                <button type="button" id="passkey" class="secondary" hidden>Use a passkey</button>
+                <button type="button" id="use-recovery-key" class="quiet" hidden>Use a recovery key</button>
+              </div>
+            </fieldset>
+          </form>
+          <section id="overview" aria-label="Installation status" hidden>
+            <p class="description">Sentinel checks the installation automatically.</p>
+            <div class="components">
+              <section aria-labelledby="orbis-title">
+                <h2 id="orbis-title">Orbis</h2>
+                <dl>
+                  <div><dt>Version</dt><dd id="orbis-version">Checking…</dd></div>
+                  <div><dt>State</dt><dd id="orbis-state">Checking…</dd></div>
+                </dl>
+              </section>
+              <section aria-labelledby="sentinel-title">
+                <h2 id="sentinel-title">Sentinel</h2>
+                <dl>
+                  <div><dt>Version</dt><dd id="sentinel-version">Checking…</dd></div>
+                  <div><dt>State</dt><dd id="sentinel-state">Checking…</dd></div>
+                </dl>
+              </section>
+            </div>
+            <section id="handoff-status" class="operation" aria-labelledby="handoff-title">
+              <div class="operation-heading">
+                <h2 id="handoff-title" tabindex="-1">Controller handoff</h2>
+                <span id="handoff-phase" class="operation-phase" role="status">Checking…</span>
+              </div>
+              <p id="handoff-detail" class="description" hidden></p>
+              <dl id="handoff-record" hidden>
+                <div><dt>Plan</dt><dd id="handoff-plan"></dd></div>
+              </dl>
+              <div id="controller-return" class="controller-return" hidden>
+                <button type="button" id="review-return">Return to Orbis</button>
+                <form id="confirm-return" aria-labelledby="return-title" hidden>
+                  <h3 id="return-title" tabindex="-1">Start Orbis?</h3>
+                  <p>Start the held Orbis controller and verify its startup. Your applications stay running.</p>
+                  <div class="return-actions">
+                    <button type="submit" id="start-return">Start Orbis</button>
+                    <button type="button" id="cancel-return" class="quiet">Cancel</button>
+                  </div>
+                </form>
+                <p id="return-notice" class="description" role="status" aria-live="polite" hidden></p>
+              </div>
+            </section>
+            <section id="update-progress" class="operation" aria-labelledby="update-title">
+              <div class="operation-heading">
+                <h2 id="update-title">Orbis update</h2>
+                <span id="update-phase" class="operation-phase" role="status">Checking…</span>
+                <span id="update-spinner" class="operation-spinner" aria-hidden="true" hidden></span>
+              </div>
+              <progress id="update-bar" max="100" aria-label="Orbis update progress" hidden></progress>
+              <p id="update-detail" class="description">Checking update progress…</p>
+              <dl id="update-record" hidden>
+                <div><dt>Target version</dt><dd id="update-target"></dd></div>
+                <div><dt>Operation</dt><dd id="update-operation"></dd></div>
+              </dl>
+            </section>
+            <section class="availability" aria-labelledby="access-title">
+              <h2 id="access-title">Recovery sign-in</h2>
+              <ul>
+                <li id="account-readiness"></li>
+                <li id="key-readiness"></li>
+              </ul>
+              <p id="recovery-address-row" hidden>Bookmark this recovery address: <code id="recovery-address"></code></p>
+              <p>Keep the emergency key separate from the host and test sign-in before you need it.</p>
+            </section>
+          </section>
+        </div>
+      </section>
+      <noscript>Enable JavaScript to sign in to Orbis Sentinel.</noscript>
+    </main>
+  </body>
+</html>

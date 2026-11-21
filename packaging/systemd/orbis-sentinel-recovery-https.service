@@ -1,0 +1,45 @@
+[Unit]
+Description=Orbis Sentinel independent recovery HTTPS transport
+Requires=orbis-sentinel-recovery-https.socket
+After=orbis-sentinel-recovery-https.socket
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+DynamicUser=yes
+User=orbis-sentinel-https
+Group=orbis-sentinel-https
+UMask=0077
+EnvironmentFile=/etc/orbis-sentinel/recovery-https.env
+ExecStart=/usr/bin/python3 -I ${ORBIS_SENTINEL_EDGE_RUNTIME} --recovery-https-edge
+LoadCredential=edge-profile:/var/lib/orbis-sentinel/recovery-https/active/profile.json
+LoadCredential=edge-chain:/var/lib/orbis-sentinel/recovery-https/active/chain.pem
+LoadCredential=edge-key:/var/lib/orbis-sentinel/recovery-https/active/key.pem
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=20s
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectClock=yes
+ProtectProc=invisible
+InaccessiblePaths=-/var/lib/orbis -/run/orbis -/run/orbis-sentinel -/var/lib/orbis-sentinel/recovery -/var/lib/orbis-sentinel/recovery-https -/run/docker.sock
+RestrictAddressFamilies=AF_INET
+SocketBindDeny=any
+IPAddressDeny=any
+IPAddressAllow=localhost
+CapabilityBoundingSet=
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+MemoryMax=96M
+TasksMax=16

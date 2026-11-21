@@ -17,7 +17,7 @@ jobs:
         with:
           node-version: '22.23.4'
       - name: Test capture page
-        run: node --test tests/test_capture_page.mjs
+        run: node --test tests/test_capture_page.mjs tests/test_recovery_page.mjs
   tests:
     strategy:
       fail-fast: false
@@ -36,7 +36,7 @@ jobs:
           PYTHONDONTWRITEBYTECODE: '1'
         shell: bash
         run: |
-          TMPDIR="$(mktemp -d "${GITHUB_WORKSPACE:?}/.sentinel-tests.XXXXXX")"
+          TMPDIR="$(mktemp -d "${GITHUB_WORKSPACE:?}/.t.XXXXXX")"
           export TMPDIR
           trap 'rm -rf -- "$TMPDIR"' EXIT
           python -m unittest discover -s tests -v

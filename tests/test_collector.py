@@ -4,9 +4,9 @@ import signal
 import socket
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
-from orbis_sentinel.collector import TelemetryCollector
+from orbis_sentinel.collector import TelemetryCollector, _sample_worker
 
 
 def _blocked_worker(output, paths, interval):
@@ -30,6 +30,24 @@ class _Process:
 
 
 class CollectorTests(unittest.TestCase):
+    def test_cached_observation_retains_original_time_and_coarse_packet_survives_limit(self):
+        coarse = {"schema": "orbis-sentinel.telemetry.v1", "sampledAt": 100}
+        rich = {"sampledAt": 100, "cpu": {"model": "x" * 200}, "memory": {}}
+        for maximum, rich_fits in [(512, True), (128, False)]:
+            with self.subTest(maximum=maximum), patch("orbis_sentinel.collector._MAX_MESSAGE", maximum), \
+                    patch("orbis_sentinel.collector.TelemetrySampler") as sampler, \
+                    patch("orbis_sentinel.collector.time.sleep", side_effect=StopIteration):
+                sampler.return_value.samples.return_value = coarse, rich
+                sampler.return_value.last_time = 4.25
+                output = Mock()
+                with self.assertRaises(StopIteration):
+                    _sample_worker(output, ("/",), 1)
+                packet = json.loads(output.send.call_args.args[0])
+                self.assertEqual(packet["observed"], 4.25)
+                self.assertEqual(packet["sample"], coarse)
+                self.assertEqual(packet.get("system"), rich if rich_fits else None)
+                output.close.assert_called_once_with()
+
     def fixture(self):
         self.now = 10.0
         collector = TelemetryCollector(interval=0.1, max_age=0.3, monotonic=lambda: self.now)
@@ -56,6 +74,37 @@ class CollectorTests(unittest.TestCase):
         stale = collector.snapshot()
         self.assertEqual(stale["state"], "stale")
         self.assertEqual(stale["ageMs"], 1000)
+
+    def test_rich_envelope_clears_incomplete_or_expired_samples_without_affecting_coarse_feed(self):
+        collector = self.fixture()
+        self.assertEqual(collector.system_snapshot(), {"schema": "orbis-sentinel.system-readings.v1",
+            "state": "starting", "ageMs": None, "sample": None})
+        coarse = {"schema": "orbis-sentinel.telemetry.v1", "sampledAt": 17000}
+        system = {"sampledAt": 17000,
+                  "cpu": {"model": "Actual model", "reportedClockGHz": 2.5, "totalPercent": 5,
+                          "perCorePercent": [5], "uptimeSeconds": 30},
+                  "memory": {"totalBytes": 10240, "availableBytes": 4096, "swapTotalBytes": 0, "swapFreeBytes": 0}}
+        self.output.send(json.dumps({"observed": 10, "sample": coarse, "system": system}).encode())
+        rich = collector.system_snapshot()
+        self.assertEqual(rich["state"], "ready")
+        self.assertEqual(rich["sample"], system)
+        self.assertEqual(collector.snapshot()["sample"], coarse)
+        rich["sample"]["cpu"]["perCorePercent"].append(99)
+        self.assertEqual(collector.system_snapshot()["sample"], system)
+        self.now = 10.2
+        self.output.send(json.dumps({"observed": self.now, "sample": {**coarse, "sampledAt": 17200},
+                                     "system": system}).encode())
+        self.assertEqual(collector.system_snapshot()["state"], "unavailable")
+        self.assertIsNone(collector.system_snapshot()["sample"])
+        self.assertEqual(collector.snapshot()["sample"]["sampledAt"], 17200)
+        self.now = 10.25
+        self.output.send(json.dumps({"observed": self.now, "sample": {**coarse, "sampledAt": 17250},
+                                     "system": {**system, "sampledAt": 17250, "memory": {}}}).encode())
+        self.assertEqual(collector.system_snapshot()["state"], "unavailable")
+        self.now = 11
+        self.assertEqual(collector.system_snapshot()["state"], "stale")
+        self.assertIsNone(collector.system_snapshot()["sample"])
+        self.assertEqual(collector.snapshot()["sample"]["sampledAt"], 17250)
 
     def test_future_reordered_malformed_nonfinite_and_oversize_packets_ignored(self):
         collector = self.fixture()

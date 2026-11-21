@@ -71,6 +71,22 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(json.loads(body), {"ok": True})
         self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o600)
 
+    def test_system_readings_endpoint_is_fixed_bodyless_get_with_a_separate_provider(self):
+        route = b"/sentinel/api/v1/system-readings"
+        snapshot = {"schema": "orbis-sentinel.system-readings.v1",
+                    "state": "unavailable", "ageMs": 12, "sample": None}
+        provider = mock.Mock(return_value=snapshot)
+        self.start({route.decode(): provider, ROUTE: lambda: {"ok": True}})
+        valid = self.request(b"GET " + route + b" HTTP/1.1\r\n\r\n")
+        header, body = valid.split(b"\r\n\r\n")
+        self.assertIn(b"200 OK", header)
+        self.assertEqual(json.loads(body), snapshot)
+        for request, status in [(b"POST " + route + b" HTTP/1.1\r\n\r\n", b"405"),
+                                (b"GET " + route + b"?mode=current HTTP/1.1\r\n\r\n", b"404"),
+                                (b"GET " + route + b" HTTP/1.1\r\nContent-Length: 1\r\n\r\na", b"400")]:
+            self.assertIn(status, self.request(request).split(b"\r\n", 1)[0])
+        provider.assert_called_once_with()
+
     def test_capture_route_is_explicit_read_only_and_cache_only(self):
         point = "12345678-1234-4123-8123-123456789abc"
         calls = []

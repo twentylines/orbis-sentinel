@@ -14,6 +14,7 @@ from unittest.mock import patch
 from orbis_sentinel.runtime import activation_listener, main
 from orbis_sentinel.collector import TelemetryCollector
 from orbis_sentinel.server import SentinelServer
+from orbis_sentinel.status import ComponentStatus
 from test_collector import _blocked_worker
 
 
@@ -30,6 +31,22 @@ class ActivationTests(unittest.TestCase):
             self.assertEqual(main(["--systemd-socket"]), 1)
             collector.return_value.start.assert_not_called()
             collector.return_value.close.assert_called_once()
+
+    def test_status_uses_cached_component_observation_without_calling_orbis(self):
+        with patch('orbis_sentinel.runtime.TelemetryCollector'), \
+                patch('orbis_sentinel.runtime.ObserverCollector') as observer, \
+                patch('orbis_sentinel.runtime.SentinelServer') as server, \
+                patch('orbis_sentinel.runtime.threading.Event') as stop, \
+                patch('orbis_sentinel.runtime.threading.Thread'), \
+                patch('orbis_sentinel.runtime.signal.signal'):
+            stop.return_value.wait.return_value = True
+            observer.return_value.component_snapshot.return_value = ComponentStatus('0.8.8', None, 'unavailable')
+            self.assertEqual(main(['--socket', '/run/sentinel/api.sock', '--observer-socket', '/run/orbis-observer/progress.sock']), 0)
+            providers = server.call_args.args[1]
+            status = providers['/sentinel/api/v1/status']()
+            self.assertEqual(status['components']['orbis'], {'installedVersion': '0.8.8', 'availableVersion': None, 'state': 'unavailable'})
+            self.assertEqual(status['components']['sentinel']['state'], 'healthy')
+            observer.return_value.component_snapshot.assert_called_once_with()
 
 
 @unittest.skipUnless(sys.platform.startswith("linux"), "requires real Linux Unix peer credentials")

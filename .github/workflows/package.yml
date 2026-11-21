@@ -39,12 +39,13 @@ jobs:
         run: |
           mkdir -m 700 sentinel-package-work
           mkdir -m 700 sentinel-package-work/tmp
+          mkdir -m 700 .t
       - name: Test
         env:
-          TMPDIR: ${{ github.workspace }}/sentinel-package-work/tmp
+          TMPDIR: ${{ github.workspace }}/.t
         run: |
           python -m unittest discover -s tests -v
-          node --test tests/test_capture_page.mjs tests/test_attest_package.mjs
+          node --test tests/test_capture_page.mjs tests/test_attest_package.mjs tests/test_recovery_page.mjs
       - name: Build and qualify package
         id: package
         env:

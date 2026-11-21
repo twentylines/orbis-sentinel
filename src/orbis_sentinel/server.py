@@ -18,7 +18,7 @@ import time
 from .contracts import API_PREFIX
 from .capture_page import PageAsset, page_asset, capability as page_capability, CSP
 
-_ROUTES = frozenset(API_PREFIX + "/" + name for name in ("health", "status", "telemetry", "progress"))
+_ROUTES = frozenset(API_PREFIX + "/" + name for name in ("health", "status", "telemetry", "system-readings", "progress", "handoff-status"))
 _TOKEN = re.compile(rb"[!#$%&'*+.^_`|~0-9A-Za-z-]+\Z")
 _MAX_HEADERS = 16384
 _MAX_LINE = 8192

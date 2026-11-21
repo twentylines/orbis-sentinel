@@ -1,0 +1,16 @@
+[Unit]
+Description=Orbis Sentinel independent HTTPS socket
+Wants=network-online.target
+After=network-online.target
+
+[Socket]
+# The retained installer supplies the one reviewed address, port and client prefix.
+Accept=no
+Service=orbis-sentinel-recovery-https.service
+FileDescriptorName=recovery-https
+Backlog=16
+NoDelay=yes
+IPAddressDeny=any
+
+[Install]
+WantedBy=sockets.target

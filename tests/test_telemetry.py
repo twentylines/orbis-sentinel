@@ -30,6 +30,58 @@ class TelemetryTests(unittest.TestCase):
     def net(self, lines):
         self.write("net/dev", "Inter-| Receive | Transmit\n face |bytes packets |bytes packets\n" + lines + "\n")
 
+    def rich_inputs(self):
+        self.write("cpuinfo", "model name : Actual   CPU\ncpu MHz : 1200.0\ncpu MHz : 2400.0\n")
+        self.write("uptime", "71.4 121.9\n")
+        self.write("meminfo", "MemTotal: 100 kB\nMemAvailable: 40 kB\nSwapTotal: 20 kB\nSwapFree: 10 kB\n")
+        self.write("stat", "cpu 10 0 10 80 0 0 0 0\ncpu9 5 0 5 40 0 0 0 0\ncpu2 5 0 5 40 0 0 0 0\n")
+
+    def test_whole_host_group_shares_real_timestamp_and_measured_counter_sources(self):
+        self.rich_inputs()
+        self.sampler.wall_time = lambda: 17.0 + self.now
+        self.assertIsNone(self.sampler.samples()[1])
+        self.now = 2
+        self.write("stat", "cpu 20 0 20 120 0 0 0 0\ncpu9 15 0 15 60 0 0 0 0\ncpu2 5 0 5 60 0 0 0 0\n")
+        coarse, system = self.sampler.samples()
+        self.assertEqual(system["sampledAt"], coarse["sampledAt"])
+        self.assertEqual(system["sampledAt"], 19000)
+        self.assertEqual(system["cpu"]["totalPercent"], coarse["cpuPercent"])
+        self.assertAlmostEqual(system["cpu"]["totalPercent"], 100 / 3)
+        self.assertEqual(system["cpu"]["perCorePercent"], [0, 50])
+        self.assertEqual(system["cpu"]["model"], "Actual CPU")
+        self.assertEqual(system["cpu"]["reportedClockGHz"], 1.8)
+        self.assertEqual(system["cpu"]["uptimeSeconds"], 71.4)
+        self.assertEqual(system["memory"], {"totalBytes": 102400, "availableBytes": 40960,
+                                            "swapTotalBytes": 20480, "swapFreeBytes": 10240})
+        self.assertEqual(coarse["memory"], {"totalBytes": 102400, "availableBytes": 40960})
+        self.assertNotIn("cpu", coarse)
+        system["cpu"]["perCorePercent"][0] = 100
+        self.assertEqual(self.sampler.samples()[1]["cpu"]["perCorePercent"], [0, 50])
+
+    def test_partial_or_discontinuous_group_never_reuses_last_rich_observation(self):
+        self.rich_inputs()
+        self.sampler.sample()
+        self.now = 2
+        self.write("stat", "cpu 20 0 20 120\ncpu9 15 0 15 60\ncpu3 5 0 5 60\n")
+        self.assertIsNone(self.sampler.samples()[1])  # hotplug
+        self.now = 3
+        self.write("stat", "cpu 30 0 30 160\ncpu9 25 0 25 80\ncpu3 5 0 5 80\n")
+        self.write("cpuinfo", "model name : Model with nominal 3.0GHz\n")
+        coarse, system = self.sampler.samples()
+        self.assertIsNotNone(coarse["cpuPercent"])
+        self.assertIsNone(system)
+        self.now = 40
+        self.write("cpuinfo", "model name : Actual CPU\ncpu MHz : 2500.0\n")
+        self.write("stat", "cpu 40 0 40 200\ncpu9 35 0 35 100\ncpu3 5 0 5 100\n")
+        self.assertIsNone(self.sampler.samples()[1])  # elapsed out of bounds
+        self.now = 41
+        self.write("stat", "cpu 50 0 50 240\ncpu9 45 0 45 120\ncpu3 5 0 5 120\n")
+        self.assertEqual(self.sampler.samples()[1]["cpu"]["reportedClockGHz"], 2.5)
+        self.now = 42
+        self.write("stat", "cpu 60 0 60 280\ncpu9 55 0 55 140\ncpu3 5 0 5 140\n")
+        self.write("meminfo", "MemTotal: 100 kB\nMemAvailable: 40 kB\nSwapTotal: 5 kB\nSwapFree: 10 kB\n")
+        self.assertIsNone(self.sampler.samples()[1])
+
     def test_initial_then_delta_and_cache_isolation(self):
         first = self.sampler.sample()
         self.assertIsNone(first["cpuPercent"])

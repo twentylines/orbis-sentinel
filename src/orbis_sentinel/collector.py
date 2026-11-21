@@ -11,6 +11,31 @@ import time
 from .telemetry import TelemetrySampler
 
 _MAX_MESSAGE = 64 * 1024
+_MAX_SAFE_INTEGER = 2 ** 53 - 1
+
+
+def _valid_system(sample, sampled_at):
+    if (type(sample) is not dict or set(sample) != {"sampledAt", "cpu", "memory"}
+            or type(sample["sampledAt"]) is not int or not 0 < sample["sampledAt"] <= _MAX_SAFE_INTEGER
+            or type(sampled_at) is not int or sample["sampledAt"] != sampled_at):
+        return False
+    cpu, memory = sample["cpu"], sample["memory"]
+    if (type(cpu) is not dict or set(cpu) != {"model", "reportedClockGHz", "totalPercent", "perCorePercent", "uptimeSeconds"}
+            or type(memory) is not dict or set(memory) != {"totalBytes", "availableBytes", "swapTotalBytes", "swapFreeBytes"}):
+        return False
+
+    def number(value, limit):
+        return type(value) in (int, float) and 0 <= value <= limit
+
+    model, cores, clock = cpu["model"], cpu["perCorePercent"], cpu["reportedClockGHz"]
+    return (type(model) is str and 0 < len(model) <= 200 and model == model.strip()
+            and all(ord(character) >= 32 and ord(character) != 127 for character in model)
+            and number(clock, 100) and clock > 0 and number(cpu["totalPercent"], 100)
+            and number(cpu["uptimeSeconds"], _MAX_SAFE_INTEGER)
+            and type(cores) is list and 0 < len(cores) <= 256 and all(number(core, 100) for core in cores)
+            and all(type(value) is int and 0 <= value <= _MAX_SAFE_INTEGER for value in memory.values())
+            and 0 < memory["totalBytes"] and memory["availableBytes"] <= memory["totalBytes"]
+            and memory["swapFreeBytes"] <= memory["swapTotalBytes"])
 
 
 def _sample_worker(output, paths, interval):
@@ -20,8 +45,16 @@ def _sample_worker(output, paths, interval):
         while True:
             started = time.monotonic()
             try:
-                encoded = json.dumps({"observed": started, "sample": sampler.sample()},
-                                     allow_nan=False, separators=(",", ":")).encode("utf-8")
+                coarse, system = sampler.samples()
+                # Cache hits retain the underlying monotonic observation time.
+                packet = {"observed": sampler.last_time, "sample": coarse}
+                if system is not None:
+                    packet["system"] = system
+                encoded = json.dumps(packet, allow_nan=False, separators=(",", ":")).encode("utf-8")
+                if len(encoded) > _MAX_MESSAGE and system is not None:
+                    # A large rich record must never crowd the existing feed out of its frame.
+                    del packet["system"]
+                    encoded = json.dumps(packet, allow_nan=False, separators=(",", ":")).encode("utf-8")
                 if len(encoded) <= _MAX_MESSAGE:
                     output.send(encoded)
             except (OSError, ValueError, TypeError):
@@ -52,7 +85,7 @@ class TelemetryCollector:
         self.worker, self.clock = worker, monotonic
         self.lock = threading.Lock()
         self.process = self.receiver = None
-        self.sample = self.observed = self.started = None
+        self.sample = self.system_sample = self.observed = self.started = None
         self.attempts = []
         self.closed = False
         self.failed = False
@@ -80,7 +113,7 @@ class TelemetryCollector:
         self.receiver, self.process = receiver, process
         self.started = now
         self.stopping_at = None
-        self.observed = self.sample = None
+        self.observed = self.sample = self.system_sample = None
         self.attempts.append(now)
 
     def _receive(self, now):
@@ -104,23 +137,36 @@ class TelemetryCollector:
                 # Reject non-finite JSON accepted by Python's decoder as extensions.
                 json.dumps(sample, allow_nan=False)
                 self.observed, self.sample = observed, sample
+                system = value.get("system")
+                self.system_sample = system if _valid_system(system, sample.get("sampledAt")) else None
             except (KeyError, TypeError, ValueError, OverflowError, RecursionError):
                 continue
 
+    def _observation(self):
+        now = self.clock()
+        self._receive(now)
+        age = max(0.0, now - self.observed) if self.observed is not None else None
+        if self.closed or self.failed or self.stopping_at is not None or self.process is None or not self.process.is_alive():
+            state = "unavailable"
+        elif age is None:
+            state = "starting" if now - self.started <= self.max_age else "stale"
+        else:
+            state = "ready" if age <= self.max_age else "stale"
+        return state, int(age * 1000) if age is not None else None
+
     def snapshot(self):
         with self.lock:
-            now = self.clock()
-            self._receive(now)
-            age = max(0.0, now - self.observed) if self.observed is not None else None
-            if self.closed or self.failed or self.stopping_at is not None or self.process is None or not self.process.is_alive():
-                state = "unavailable"
-            elif age is None:
-                state = "starting" if now - self.started <= self.max_age else "stale"
-            else:
-                state = "ready" if age <= self.max_age else "stale"
+            state, age_ms = self._observation()
             return {"schema": "orbis-sentinel.telemetry-envelope.v1", "state": state,
-                    "ageMs": int(age * 1000) if age is not None else None,
-                    "sample": copy.deepcopy(self.sample)}
+                    "ageMs": age_ms, "sample": copy.deepcopy(self.sample)}
+
+    def system_snapshot(self):
+        with self.lock:
+            state, age_ms = self._observation()
+            if state == "ready" and self.system_sample is None:
+                state = "unavailable"
+            return {"schema": "orbis-sentinel.system-readings.v1", "state": state, "ageMs": age_ms,
+                    "sample": copy.deepcopy(self.system_sample) if state == "ready" else None}
 
     def maintain(self):
         with self.lock:

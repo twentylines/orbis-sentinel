@@ -50,6 +50,37 @@ def _seal(info):
             info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 
 
+def validate_capability(value):
+    """Exact protocol contract; this validates an actual child result only."""
+    expected = {'schema':'orbis.sentinel-authentication-worker.v1','version':1,'methods':['password','passkey'],
+                'role':'operator','maxIdentityBytes':65536,'maxRequestBytes':32768,'deadlineMs':10000,
+                'databaseRequired':False,'mutations':'none','grantsAuthority':False,
+                'identityContentProof':'orbis.sentinel-identity-content.v1',
+                'effectiveIdentityContentProof':'orbis.sentinel-effective-identity-content.v1',
+                'passkeyCounterProof':'orbis.sentinel-passkey-counter.v1'}
+    if (type(value) is not dict or json.dumps(value,sort_keys=True,separators=(',', ':'),allow_nan=False)
+            != json.dumps(expected,sort_keys=True,separators=(',', ':'))):
+        _fail()
+    return value
+
+
+def worker_create_arguments(name, labels, image_id, *, directory=None):
+    args = ['create', '--pull=never', '--name', name]
+    for label in labels:
+        args.extend(('--label', label))
+    args.extend(('--log-driver=none', '--network=none', '--ipc=none', '--no-healthcheck', '--restart=no',
+                 '--read-only', '--user=0:0', '--cap-drop=ALL', '--security-opt=no-new-privileges',
+                 '--pids-limit=64', '--memory=512m', '--cpus=1', '--interactive'))
+    if directory is not None:
+        args.extend(('--mount', 'type=bind,src=' + directory + ',dst=/run/orbis-recovery,readonly'))
+    args.extend(('--entrypoint', '/usr/local/bin/node', image_id, _SCRIPT))
+    return args
+
+
+def capability_create_arguments(name, labels, image_id):
+    return worker_create_arguments(name, labels, image_id) + ['--capability']
+
+
 class _Docker:
     def __init__(self, config):
         self.config = config
@@ -254,18 +285,32 @@ class RecoveryWorker:
         except Exception:
             _hold()
 
-    def _execute(self, directory, digest, challenge=None, credentials=None):
-        if type(digest) is not str or not _HASH.fullmatch(digest):
-            _fail()
-        expected = os.path.join(self._store._directory, 'profiles', digest)
-        if directory != expected or ',' in directory or any(ord(c) < 32 or ord(c) == 127 for c in directory):
-            _fail()
+    def _execute(self, directory, digest, challenge=None, credentials=None, *, content=False, counter=False, effective=None, capability=False):
+        if capability:
+            if any(v is not None for v in (directory,digest,challenge,credentials,effective)) or content or counter:
+                _fail()
+        else:
+            if type(digest) is not str or not _HASH.fullmatch(digest):
+                _fail()
+            expected = os.path.join(self._store._directory, 'profiles', digest)
+            if directory != expected or ',' in directory or any(ord(c) < 32 or ord(c) == 127 for c in directory):
+                _fail()
         body = b''
+        if (counter and challenge is None) or (effective is not None and (challenge is not None or content or counter)):
+            _fail()
         if challenge is not None:
             _token(challenge)
             if type(credentials) is not dict:
                 _fail()
             body = json.dumps(credentials, separators=(',', ':'), allow_nan=False).encode('ascii')
+            if not 0 < len(body) <= 32768:
+                _fail()
+        elif effective is not None:
+            if (type(effective) is not dict or len(effective) > 10
+                    or any(type(key) is not str or type(value) is not int or not 0 <= value <= 0xffffffff
+                           for key, value in effective.items())):
+                _fail()
+            body = json.dumps({'counters': effective}, separators=(',', ':'), allow_nan=False).encode('ascii')
             if not 0 < len(body) <= 32768:
                 _fail()
         with self._store._worker_mutex, self._store._borrow():
@@ -282,13 +327,15 @@ class RecoveryWorker:
             result = None
             failed = False
             try:
-                args = ['create', '--pull=never', '--name', record['name'], '--label', _LABEL + '=' + nonce,
-                        '--log-driver=none', '--network=none', '--ipc=none', '--no-healthcheck', '--restart=no',
-                        '--read-only', '--user=0:0', '--cap-drop=ALL', '--security-opt=no-new-privileges',
-                        '--pids-limit=64', '--memory=512m', '--cpus=1', '--interactive',
-                        '--mount', 'type=bind,src=' + directory + ',dst=/run/orbis-recovery,readonly',
-                        '--entrypoint', '/usr/local/bin/node', self._image, _SCRIPT]
-                args += ['--describe-identity', digest] if challenge is None else ['--verify', digest, challenge]
+                if capability:
+                    args = capability_create_arguments(record['name'], (_LABEL + '=' + nonce,), self._image)
+                else:
+                    args = worker_create_arguments(record['name'], (_LABEL + '=' + nonce,), self._image, directory=directory)
+                if not capability and challenge is None:
+                    args += [('--describe-effective-content' if effective is not None else
+                              '--describe-content' if content else '--describe-identity'), digest]
+                elif not capability:
+                    args += ['--verify-counter' if counter else '--verify', digest, challenge]
                 identity = self._call(args).decode('ascii').strip()
                 if not _HASH.fullmatch(identity):
                     _hold()
@@ -302,12 +349,22 @@ class RecoveryWorker:
                 result = _json(output)
                 if type(result) is not dict:
                     _fail()
+                if capability:
+                    validate_capability(result)
             except Exception:
                 failed = True
             self._cleanup(record)
             if failed:
                 _fail()
             return result
+
+    def capability(self):
+        try:
+            return self._execute(None,None,capability=True)
+        except RecoveryWorkerCleanupRequired:
+            raise RecoveryWorkerCleanupRequired('Recovery worker cleanup requires reconciliation.') from None
+        except Exception:
+            _fail()
 
     def inspect(self, directory, digest):
         try:
@@ -317,9 +374,33 @@ class RecoveryWorker:
         except Exception:
             _fail()
 
+    def inspect_content(self, directory, digest):
+        try:
+            return self._execute(directory, digest, content=True)
+        except RecoveryWorkerCleanupRequired:
+            raise RecoveryWorkerCleanupRequired('Recovery worker cleanup requires reconciliation.') from None
+        except Exception:
+            _fail()
+
     def verify(self, directory, digest, challenge, credentials):
         try:
             return self._execute(directory, digest, challenge, credentials)
+        except RecoveryWorkerCleanupRequired:
+            raise RecoveryWorkerCleanupRequired('Recovery worker cleanup requires reconciliation.') from None
+        except Exception:
+            _fail()
+
+    def verify_counter(self, directory, digest, challenge, response):
+        try:
+            return self._execute(directory, digest, challenge, response, counter=True)
+        except RecoveryWorkerCleanupRequired:
+            raise RecoveryWorkerCleanupRequired('Recovery worker cleanup requires reconciliation.') from None
+        except Exception:
+            _fail()
+
+    def inspect_effective_content(self, directory, digest, counters):
+        try:
+            return self._execute(directory, digest, effective=counters)
         except RecoveryWorkerCleanupRequired:
             raise RecoveryWorkerCleanupRequired('Recovery worker cleanup requires reconciliation.') from None
         except Exception:

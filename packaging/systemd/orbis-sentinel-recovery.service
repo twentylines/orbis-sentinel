@@ -1,0 +1,45 @@
+[Unit]
+Description=Orbis Sentinel independent recovery listener
+Wants=docker.service orbis-sentinel.socket
+After=docker.service orbis-sentinel.socket
+ConditionPathExists=/etc/orbis-sentinel/recovery.env
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=root
+Group=root
+UMask=0077
+EnvironmentFile=/etc/orbis-sentinel/recovery.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/usr/bin/python3 -I ${ORBIS_SENTINEL_RECOVERY_RUNTIME} --recovery-profile ${ORBIS_SENTINEL_RECOVERY_PROFILE}
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=190s
+KillMode=control-group
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/orbis-sentinel/recovery
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+ProtectClock=yes
+ProtectProc=invisible
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=any
+IPAddressAllow=localhost
+CapabilityBoundingSet=
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+MemoryMax=256M
+TasksMax=32
+
+[Install]
+WantedBy=multi-user.target
