@@ -27,11 +27,21 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
+      - name: Check out the Core credential fence contract
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: twentylines/orbis
+          ref: ebafc0977a2421e57ebd1ce0cbf81813ff3f90d5
+          path: core-contract
+          sparse-checkout: scripts/orbis-host-credential-fence.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
       - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python }}
       - name: Test
         env:
+          ORBIS_RECOVERY_TEST_CORE: ${{ github.workspace }}/core-contract
           PYTHONPATH: src
           PYTHONDONTWRITEBYTECODE: '1'
         shell: bash

@@ -342,7 +342,10 @@ class Pairs(unittest.TestCase):
     def test_late_and_ninth_socket_never_reach_http_and_shutdown_drains(self):
         self.prepare()
         routed = self.config_body
-        with backend.open_listener(self.marker_body,digest(encoded(self.marker_body)),routed) as peer:
+        # Keep incomplete handshakes pending until shutdown so slot admission
+        # and drain are independent of the production deadline tested above.
+        with (backend.open_listener(self.marker_body,digest(encoded(self.marker_body)),routed) as peer,
+              mock.patch.object(recovery_gateway,'BACKEND_HANDSHAKE_TIMEOUT',float('inf'))):
             server = recovery_gateway.RecoveryHTTPServer(('127.0.0.1',0),mock.Mock(),backend=peer)
             thread = threading.Thread(target=server.serve_forever,kwargs={'poll_interval':0.02})
             thread.start()
@@ -350,7 +353,7 @@ class Pairs(unittest.TestCase):
                 with ExitStack() as resources:
                     for occupied in range(1,9):
                         resources.enter_context(socket.create_connection(server.server_address,timeout=1))
-                        expires = time.monotonic()+.3
+                        expires = time.monotonic()+3
                         while server._slots._value != 8-occupied and time.monotonic() < expires:
                             time.sleep(.005)
                         self.assertEqual(server._slots._value,8-occupied)
@@ -359,6 +362,7 @@ class Pairs(unittest.TestCase):
                             self.assertEqual(late.recv(1),b'')
                         except ConnectionResetError:
                             pass
+                    self.assertEqual(server._slots._value,0)
                     start = time.monotonic()
                     server.shutdown()
                     server.server_close()

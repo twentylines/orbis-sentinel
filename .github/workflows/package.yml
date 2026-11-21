@@ -28,6 +28,15 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Check out the Core credential fence contract
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: twentylines/orbis
+          ref: ebafc0977a2421e57ebd1ce0cbf81813ff3f90d5
+          path: core-contract
+          sparse-checkout: scripts/orbis-host-credential-fence.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.10'
@@ -42,6 +51,7 @@ jobs:
           mkdir -m 700 .t
       - name: Test
         env:
+          ORBIS_RECOVERY_TEST_CORE: ${{ github.workspace }}/core-contract
           TMPDIR: ${{ github.workspace }}/.t
         run: |
           python -m unittest discover -s tests -v
