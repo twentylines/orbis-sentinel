@@ -28,15 +28,33 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Check out the Core credential fence contract
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: twentylines/orbis
-          ref: ebafc0977a2421e57ebd1ce0cbf81813ff3f90d5
-          path: core-contract
-          sparse-checkout: scripts/orbis-host-credential-fence.py
-          sparse-checkout-cone-mode: false
-          persist-credentials: false
+      - name: Fetch the pinned Core credential fence contract
+        env:
+          CORE_CONTRACT_COMMIT: ebafc0977a2421e57ebd1ce0cbf81813ff3f90d5
+        shell: bash
+        run: |
+          python3 - <<'PYCORE'
+          import hashlib, os, pathlib, urllib.request
+          commit = os.environ['CORE_CONTRACT_COMMIT']
+          filenames = (
+              'orbis-host-credential-fence.py',
+              'test_orbis_host_credential_fence_contract.py',
+          )
+          sha256 = (
+              '687750c070190bb756555c09a040cd3a7468d6b8abd2511a1ec8827fe329f985',
+              '22496f85ac42c37307667db97834950f89ab9bd42d96bd0f22a203ac22889a16',
+          )
+          destination = pathlib.Path('core-contract/scripts')
+          destination.mkdir(parents=True)
+          for name, expected in zip(filenames, sha256):
+              url = f'https://raw.githubusercontent.com/twentylines/orbis/{commit}/scripts/{name}'
+              with urllib.request.urlopen(url, timeout=30) as source:
+                  body = source.read(65537)
+              if len(body) > 65536 or hashlib.sha256(body).hexdigest() != expected:
+                  raise SystemExit(f'Core contract digest mismatch: {name}')
+              (destination / name).write_bytes(body)
+          PYCORE
+          python3 -B core-contract/scripts/test_orbis_host_credential_fence_contract.py -v
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.10'
