@@ -51,8 +51,10 @@ _SELECTION_PROOFS = {'core': 'release-manifest.json', 'launcher': 'installer-sou
 _CUSTODY_FILES = {'copy-custody.json': 65536, 'installer-source-selection.json': 16384,
                   'installer-source-execution.json': 4096}
 _HOST_COPY_FIELDS = ('schema', 'root', 'context', 'selection', 'installed', 'bindings')
-_BUNDLE_LIMITS = {'release': {'orbis.installer-bundle.v1': 66, 'orbis.installer-bundle.v3': MAX_FILES},
-                  'modular': {'orbis.installer-bundle.v2': 66, 'orbis.installer-bundle.v4': MAX_FILES}}
+_BUNDLE_LIMITS = {'release': {'orbis.installer-bundle.v1': 66, 'orbis.installer-bundle.v3': MAX_FILES,
+                              'orbis.installer-bundle.v5': 160},
+                  'modular': {'orbis.installer-bundle.v2': 66, 'orbis.installer-bundle.v4': MAX_FILES,
+                              'orbis.installer-bundle.v6': 160}}
 _SHA = re.compile(r'[a-f0-9]{64}\Z')
 _IMAGE_DIGEST = re.compile(r'sha256:[a-f0-9]{64}\Z')
 _COMMIT = re.compile(r'[a-f0-9]{40}\Z')

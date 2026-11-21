@@ -986,6 +986,41 @@ class FormatTests(unittest.TestCase):
                 publication._manifest(body, 'release', {'tag': core['tag'], 'commit': CORE_COMMIT,
                                                         'manifestSha256': publication.sha(body)})
 
+    def test_bundle_manifest_count_limits_are_versioned_and_mode_specific(self):
+        required = bundle_files()
+        self.assertEqual(publication.MAX_FILES, 128)
+        for mode, versions, wrong_version in (('release', (1, 3, 5), 6), ('modular', (2, 4, 6), 5)):
+            identity = {'commit': CORE_COMMIT, 'tag': 'v0.8.5'}
+            binding = ({**identity, 'releaseManifestSha256': '8' * 64} if mode == 'release'
+                       else {'installerCommit': CORE_COMMIT})
+            for version, limit in zip(versions, (66, 128, 160)):
+                schema = f'orbis.installer-bundle.v{version}'
+                with self.subTest(mode=mode, schema=schema):
+                    files = required.copy()
+                    for index in range(limit - len(required)):
+                        suffix = chr(97 + index // 26) + chr(97 + index % 26)
+                        files[f'scripts/orbis-fixture-{suffix}.py'] = b''
+                    archive = io.BytesIO()
+                    with gzip.GzipFile(fileobj=archive, mode='wb', mtime=0) as compressed:
+                        with tarfile.open(fileobj=compressed, mode='w', format=tarfile.USTAR_FORMAT) as tar:
+                            for name, content in sorted(files.items()):
+                                entry = tarfile.TarInfo(name)
+                                entry.size = len(content)
+                                tar.addfile(entry, io.BytesIO(content))
+                    archive_bytes = archive.getvalue()
+                    manifest = {**binding, 'schema': schema, 'archive': 'orbis-installer.tar.gz',
+                                'archiveBytes': len(archive_bytes), 'archiveSha256': publication.sha(archive_bytes),
+                                'files': {name: record(content, 'size') for name, content in files.items()}}
+                    body = publication.encoded(manifest)
+                    verified = publication._manifest(body, mode, {**identity, 'manifestSha256': publication.sha(body)})
+                    self.assertEqual(publication._archive(archive_bytes, verified), files)
+                    for invalid in ({**manifest, 'schema': f'orbis.installer-bundle.v{wrong_version}'},
+                                    {**manifest, 'files': {**manifest['files'],
+                                                           'scripts/orbis-over-limit.py': record(b'', 'size')}}):
+                        body = publication.encoded(invalid)
+                        with self.assertRaises(publication.SourcePublicationError):
+                            publication._manifest(body, mode, {**identity, 'manifestSha256': publication.sha(body)})
+
     def test_strict_json_and_ast_reject_ambiguous_literals(self):
         for invalid in (b'{"a":1,"a":1}', b'{"a":NaN}', b'{"a":1.0}', b'{"a":"\xff"}'):
             with self.subTest(invalid=invalid), self.assertRaises(publication.SourcePublicationError):
