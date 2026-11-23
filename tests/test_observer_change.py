@@ -30,17 +30,22 @@ class ScopedSupervisor:
                     'DropInPaths': str(activate._observer_paths()['host']) if f.loaded_host else '',
                     'NeedDaemonReload': 'no', 'KillMode': 'control-group', 'ActiveState': 'active',
                     'SubState': 'running', 'MainPID': str(f.host_pid), 'ControlPID': '0',
-                    'InvocationID': 'd' * 32, 'ControlGroup': '/system.slice/orbis-host.service'}
+                    'InvocationID': format(f.host_pid, '032x'), 'ControlGroup': '/system.slice/orbis-host.service'}
         if name == 'orbis-host-observer.socket':
             return {'LoadState': 'loaded' if f.loaded_socket else 'not-found',
                     'FragmentPath': str(activate._observer_paths()['socket']) if f.loaded_socket else '',
                     'DropInPaths': '', 'NeedDaemonReload': 'no', 'ControlPID': '0',
                     'ActiveState': 'active' if f.observer_active else 'inactive',
-                    'SubState': 'listening' if f.observer_active else 'dead'}
+                    'SubState': f.socket_substate if f.observer_active else 'dead'}
         return f.systemd.inspect(name)
 
     def run(self, action, *names):
         f = self.fixture
+        if action == 'start' and names == ('orbis-host-observer.socket',) and not f.observer_active:
+            # Linux systemd cannot start a newly associated activation socket
+            # while its service is already active. A fake supervisor must not
+            # conceal that constraint by silently accepting the request.
+            raise activate.ActivationError('Socket service is already active')
         if action == 'show':
             f.systemd.events.append((action, *names))
             return 'Requires=' + ('orbis-host-observer.socket' if f.foreign_dependency else '') + '\nBindsTo=\nPartOf=\n'
@@ -79,6 +84,7 @@ class ObserverChangeTests(unittest.TestCase):
             destination.write_bytes((PACKAGING / relative).read_bytes())
         self.host_pid = 4321
         self.loaded_host = self.loaded_socket = self.observer_active = False
+        self.socket_substate = 'listening'
         self.group = None
         self.change_host = self.foreign_dependency = False
         self.sysusers_calls = []
@@ -156,6 +162,7 @@ class ObserverChangeTests(unittest.TestCase):
         self.assertEqual(result['profile']['profile'], 'orbis-observer-v2')
         self.assertEqual(self.change_record()['phase'], 'complete')
         self.assertEqual(len(self.sysusers_calls), 1)
+        self.assertFalse(self.observer_active)
         self.assert_host_preserved()
         restored = self.restore(result['ticket'])
         self.assertTrue(restored['restored']);self.assertIsNone(restored['profile'])
@@ -180,6 +187,14 @@ class ObserverChangeTests(unittest.TestCase):
         self.assert_host_preserved()
         self.assertTrue(activate.restore_retained(self.retention, activation_lock_fd=self.lease)['restored'])
 
+    def test_active_socket_may_already_be_serving_its_host(self):
+        self.prepare(original=True)
+        self.socket_substate = 'running'
+        result = self.enroll()
+        self.assertTrue(result['enrolled'])
+        self.assertTrue(self.restore(result['ticket'])['restored'])
+        self.assert_host_preserved()
+
     def test_existing_v2_needs_no_service_restart_or_system_configuration_rewrite(self):
         self.prepare(original='orbis-observer-v2')
         before={role: (path.stat().st_ino,path.read_bytes()) for role,path in activate._observer_paths().items()}
@@ -201,7 +216,31 @@ class ObserverChangeTests(unittest.TestCase):
         # boundary; no collector reload has happened before that acknowledgement.
         result=activate.activate_observer_profile(prepared['ticket'],activation_lock_fd=self.lease)
         self.assertTrue(result['enrolled']);self.assertEqual(self.change_record()['phase'],'complete')
+        self.assertFalse(self.observer_active)
+        self.assertNotIn(('start', 'orbis-host-observer.socket'), self.systemd.events)
         self.assert_host_preserved()
+
+    def test_deferred_socket_is_observed_without_restarting_the_original_host(self):
+        self.prepare()
+        result = self.enroll()
+        before = list(self.systemd.events)
+        self.assertEqual(activate.activate_observer_profile(result['ticket'], activation_lock_fd=self.lease), result)
+        self.assertEqual(self.systemd.events, before)
+        self.assertFalse(self.observer_active)
+        self.assert_host_preserved()
+
+    def test_return_after_helper_start_preserves_the_new_host_and_stops_its_removed_socket(self):
+        self.prepare()
+        result = self.enroll()
+        # The admitted helper maintenance is outside this toolkit API. Model
+        # its new process inheriting the now-loaded socket dependency.
+        self.host_pid += 100
+        self.observer_active = True
+        current_host = self.host_pid
+        self.assertEqual(activate.activate_observer_profile(result['ticket'], activation_lock_fd=self.lease), result)
+        self.assertTrue(self.restore(result['ticket'])['restored'])
+        self.assertEqual(self.host_pid, current_host)
+        self.assertFalse(self.observer_active)
 
     def test_cancelled_preparation_can_return_without_restarting_either_service(self):
         self.prepare()

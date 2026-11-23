@@ -267,11 +267,22 @@ def managed_observer_api_roundtrip(record):
             enrolled = activation.activate_observer_profile(prepared['ticket'], activation_lock_fd=lease)
             assert enrolled['enrolled'] and enrolled['profile'] == prepared['profile']
             assert activation._observer_host(activation.Systemd(), enrolled['profile']) == original_host
+            activation._observer_socket(activation.Systemd(), False)
+            assert systemd.run('show', 'orbis-host.service', '--property=TriggeredBy', '--value').strip() == 'orbis-host-observer.socket'
             activation._ready(activation.Systemd(), record['version'])
+            await_progress(progress)
+            # A real helper replacement stops the old process before starting
+            # its successor. Exercise the actual socket dependency at that
+            # boundary using this explicitly disposable Host placeholder.
+            systemd.run('stop', 'orbis-host.service')
+            systemd.run('start', 'orbis-host.service')
+            replacement_host = activation._observer_host(activation.Systemd(), enrolled['profile'])
+            assert replacement_host['InvocationID'] != original_host['InvocationID']
+            activation._observer_socket(activation.Systemd(), True)
             await_progress(progress)
             returned = activation.restore_observer_profile(prepared['ticket'], activation_lock_fd=lease)
             assert returned['restored'] and returned['profile'] is None
-            assert activation._observer_host(activation.Systemd(), None) == original_host
+            assert activation._observer_host(activation.Systemd(), None) == replacement_host
             activation._ready(activation.Systemd(), record['version'])
         # A known prepared change can return if the progress endpoint cannot
         # start. Neither Host nor collector may restart in that path.
@@ -283,7 +294,7 @@ def managed_observer_api_roundtrip(record):
         assert activation.restore_observer_profile(prepared['ticket'], activation_lock_fd=lease)['restored']
         same = activation.Systemd().inspect('orbis-sentinel.service')
         assert all(same[key] == before[key] for key in ('MainPID', 'InvocationID', 'ControlGroup'))
-        assert activation._observer_host(activation.Systemd(), None) == original_host
+        assert activation._observer_host(activation.Systemd(), None) == replacement_host
         other = os.open(activation.STATE / 'activation.lock', os.O_RDWR | os.O_NOFOLLOW)
         try:
             try:
@@ -540,6 +551,7 @@ def main():
                   'managed-observer-api-prepare-without-restart', 'managed-observer-api-progress-ready-before-restart',
                   'managed-observer-api-activation-preserves-host', 'managed-observer-api-return-preserves-host',
                   'managed-observer-api-prepared-only-return-without-restart', 'managed-observer-api-preserves-parent-lease',
+                  'deferred-observer-socket-starts-with-next-host',
                   'signed-collector-retry-preserves-managed-observer', 'unreviewed-managed-observer-change-refused',
                   'managed-independent-progress-profile-loaded', 'signed-collector-retry-preserves-independent-progress',
                   'independent-progress-with-stalled-host', 'unreviewed-independent-profile-change-refused',

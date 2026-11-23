@@ -927,7 +927,7 @@ def _observer_host(systemd, profile, *, pending=False):
 def _observer_socket(systemd, active):
     value = systemd.inspect('orbis-host-observer.socket')
     if (value.get('ActiveState') != ('active' if active else 'inactive')
-            or value.get('SubState') != ('listening' if active else 'dead')
+            or value.get('SubState') not in ({'listening', 'running'} if active else {'dead'})
             or value.get('ControlPID') != '0'
             or (active and (value.get('LoadState') != 'loaded'
                 or value.get('FragmentPath') != str(_observer_paths()['socket'])
@@ -1128,8 +1128,8 @@ def activate_observer_profile(ticket, *, activation_lock_fd):
             if record['phase'] == 'complete':
                 if _profile(systemd, True).get('observerProfile') != profile:
                     raise RecoveryRequired('The completed observer profile changed')
-                _observer_host(systemd, profile)
-                _observer_socket(systemd, True)
+                host = _observer_host(systemd, profile)
+                _observer_socket(systemd, admission['originalProfile'] is not None or host != admission['originalHost'])
                 _ready(systemd, installed['version'])
                 return {'ticket': ticket, 'profile': profile, 'enrolled': True}
             _observer_pending(systemd, admission, installed['version'])
@@ -1141,13 +1141,18 @@ def activate_observer_profile(ticket, *, activation_lock_fd):
             _write(state, 'observer-change.json', _encoded(active), 0o600, prior)
             try:
                 systemd.run('daemon-reload')
-                systemd.run('start', 'orbis-host-observer.socket')
+                # A new activation socket cannot be attached to a running
+                # service. Keep the original Host alive; its next maintenance
+                # start acquires this socket through the reviewed dependency.
+                # Independent progress is already served by the parent.
+                if admission['originalProfile'] is not None:
+                    systemd.run('start', 'orbis-host-observer.socket')
                 systemd.run('restart', 'orbis-sentinel.service')
                 fresh = Systemd()
                 if (_profile(fresh, True).get('observerProfile') != profile
                         or _observer_host(fresh, profile) != admission['originalHost']):
                     raise RecoveryRequired('Observer enrollment must preserve the running Host')
-                _observer_socket(fresh, True)
+                _observer_socket(fresh, admission['originalProfile'] is not None)
                 _ready(fresh, installed['version'])
                 _current_retention(root, state, admission['retainedActivation'])
                 _write(state, 'observer-change.json', _encoded({**record, 'phase': 'complete'}), 0o600, _encoded(active))
@@ -1210,7 +1215,7 @@ def restore_observer_profile(ticket, *, activation_lock_fd):
                 if _profile(systemd, True).get('observerProfile') != profile:
                     raise RecoveryRequired('The active observer profile changed')
                 host = _observer_host(systemd, profile)
-                _observer_socket(systemd, True)
+                _observer_socket(systemd, admission['originalProfile'] is not None or host != admission['originalHost'])
                 _ready(systemd, installed['version'])
             expected = {role: body.hex() for role, body in _observer_bodies(installed['version']).items()}
             if _observer_files() != expected:
