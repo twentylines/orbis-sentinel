@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 from types import SimpleNamespace
+import uuid
 
 
 BASE = Path('/opt/sentinel-qualification')
@@ -313,7 +314,10 @@ def main():
     activation._ready(systemd, old['version'])
     assert snapshot(old_directory) == old_files
 
-    result = cli(new, 'verify-new')
+    binding = {'operationId': str(uuid.uuid4()), 'planSha256': '4' * 64,
+               'targetDigest': 'sha256:' + '5' * 64}
+    result = activation.activate_release(**options(new, 'verify-new'), retain=binding)
+    retention = result['retainedRollback']
     assert result['previousVersion'] == old['version'] and result['reused'] is True
     activation._ready(systemd, new['version'])
     privileges(systemd)
@@ -361,6 +365,32 @@ def main():
     activation._ready(systemd, new['version'])
     privileges(systemd)
     assert snapshot(old_directory) == old_files
+    # A later component failure can return this exact, explicitly retained
+    # activation. This is a real signed-payload/systemd restoration; the
+    # broader multi-component coordinator remains outside this fixture.
+    systemd.run('reset-failed', 'orbis-sentinel.service')
+    returned = activation.restore_retained(retention)
+    assert returned['restored'] and returned['version'] == old['version']
+    assert (activation.STATE / 'installed.json').read_bytes() == old_receipt
+    activation._ready(activation.Systemd(), old['version'])
+    assert snapshot(old_directory) == old_files and snapshot(current_directory) == current_files
+    same = systemd.inspect('orbis-sentinel.service')
+    assert activation.restore_retained(retention) == returned
+    observed = systemd.inspect('orbis-sentinel.service')
+    assert all(observed[key] == same[key] for key in ('MainPID', 'InvocationID', 'ControlGroup'))
+    systemd.run('reset-failed', 'orbis-sentinel.service')
+    assert cli(new, 'verify-after-retained-return')['previousVersion'] == old['version']
+    activation._ready(activation.Systemd(), new['version'])
+    same = systemd.inspect('orbis-sentinel.service')
+    try:
+        activation.restore_retained(retention)
+    except activation.RecoveryRequired:
+        pass
+    else:
+        raise AssertionError('A superseded restoration must not return an earlier installation')
+    observed = systemd.inspect('orbis-sentinel.service')
+    assert all(observed[key] == same[key] for key in ('MainPID', 'InvocationID', 'ControlGroup'))
+    assert snapshot(old_directory) == old_files and snapshot(current_directory) == current_files
     systemd = managed_observer_profile(systemd, current_directory, new)
     with independent_progress() as progress:
         systemd = managed_observer_profile(systemd, current_directory, new, 'orbis-observer-v2', progress=progress)
@@ -370,6 +400,8 @@ def main():
         'cases': ['signed-first-install', 'fault-injected-health-rollback', 'signed-older-to-current-retry',
                   'retained-old-runtime', 'independent-unprivileged-service', 'older-installer-downgrade-refusal',
                   'older-orbis-installer-cli-refusal', 'managed-observer-profile-loaded',
+                  'exact-retained-signed-collector-return', 'retained-return-observed-replay',
+                  'signed-update-after-retained-return', 'superseded-retained-return-refusal',
                   'signed-collector-retry-preserves-managed-observer', 'unreviewed-managed-observer-change-refused',
                   'managed-independent-progress-profile-loaded', 'signed-collector-retry-preserves-independent-progress',
                   'independent-progress-with-stalled-host', 'unreviewed-independent-profile-change-refused',

@@ -11,6 +11,7 @@ import threading
 from types import SimpleNamespace
 import unittest
 from unittest import mock
+import uuid
 
 import test_build_release as fixtures
 from test_stage_release import stage
@@ -137,13 +138,25 @@ class ActivationTests(unittest.TestCase):
         if version == self.fail_health_version:
             raise activate.ActivationError('Synthetic wrong health identity')
 
-    def run_activation(self, package=None):
+    def run_activation(self, package=None, *, retain=None):
         self.systemd.__dict__.pop('_orbis_observer_profile', None)
         self.sequence += 1
         package = package or self.package
         return activate.activate_release(Path(package['artifact']), self.bundle,
             self.root / ('verify-' + str(self.sequence)), sha256=package['sha256'],
-            version=package['version'], source_commit='1' * 40, verifier=self.tool)
+            version=package['version'], source_commit='1' * 40, verifier=self.tool, retain=retain)
+
+    def retained_update(self):
+        self.run_activation()
+        binding = {'operationId': str(uuid.uuid4()), 'planSha256': '2' * 64,
+                   'targetDigest': 'sha256:' + '3' * 64}
+        result = self.run_activation(self.build('0.1.0-dev.11'), retain=binding)
+        self.systemd.events.clear()
+        return result['retainedRollback']
+
+    def run_restoration(self, ticket):
+        self.systemd.__dict__.pop('_orbis_observer_profile', None)
+        return activate.restore_retained(ticket)
 
     def journal(self):
         return json.loads((self.state / 'activation.json').read_bytes())
@@ -187,6 +200,232 @@ class ActivationTests(unittest.TestCase):
         self.assertNotIn('observerProfile', self.journal()['previousUnits'])
         self.assertEqual(list(directory.iterdir()), [])
         self.assertFalse((self.state / 'observer-profile.json').exists())
+
+    def test_default_activation_does_not_create_a_retention_ticket(self):
+        result = self.run_activation()
+        self.assertNotIn('retainedRollback', result)
+        self.assertEqual(list(self.state.glob('retention-*')), [])
+
+    def test_retained_return_restores_exact_runtime_and_writes_a_real_new_admission(self):
+        ticket = self.retained_update()
+        original = self.journal()
+        admission = (self.state / ('admission-' + original['id'] + '.json')).read_bytes()
+        result = self.run_restoration(ticket)
+        restored = self.journal()
+        self.assertTrue(result['restored'])
+        self.assertEqual(result['version'], '0.1.0-dev.10')
+        self.assertNotEqual(restored['id'], original['id'])
+        self.assertEqual(restored['phase'], 'complete')
+        self.assertEqual(restored['candidate'], original['previous'])
+        self.assertEqual(restored['previous'], original['candidate'])
+        self.assertEqual((self.state / 'installed.json').read_bytes(), activate._encoded(original['previous']))
+        self.assertEqual((self.install / 'current').readlink().as_posix(), 'releases/0.1.0-dev.10')
+        self.assertEqual((self.state / ('admission-' + restored['id'] + '.json')).read_bytes(),
+                         activate._encoded({**restored, 'phase': 'prepared'}))
+        self.assertEqual((self.state / ('result-' + original['id'] + '.json')).read_bytes(), activate._encoded(original))
+        self.assertEqual((self.state / ('admission-' + original['id'] + '.json')).read_bytes(), admission)
+        for receipt in (original['candidate'], original['previous']):
+            self.assertEqual(activate._inventory(self.install / 'releases' / receipt['version'], receipt['version']), receipt['files'])
+
+    def test_successful_return_replay_observes_health_without_repeating_effects(self):
+        ticket = self.retained_update()
+        first = self.run_restoration(ticket)
+        self.systemd.events.clear()
+        self.assertEqual(self.run_restoration(ticket), first)
+        self.assertEqual(self.systemd.events, [])
+        self.fail_health_version = '0.1.0-dev.10'
+        with self.assertRaises(activate.ActivationError):
+            self.run_restoration(ticket)
+        self.assertEqual(self.systemd.events, [])
+
+    def test_restored_installation_can_take_another_verified_update_but_old_ticket_is_spent(self):
+        ticket = self.retained_update()
+        self.run_restoration(ticket)
+        self.assertTrue(self.run_activation(self.build('0.1.0-dev.12'))['activated'])
+        before = (self.state / 'activation.json').read_bytes()
+        self.systemd.events.clear()
+        with self.assertRaises(activate.RecoveryRequired):
+            self.run_restoration(ticket)
+        self.assertEqual((self.state / 'activation.json').read_bytes(), before)
+        self.assertEqual(self.systemd.events, [])
+
+    def test_unretained_and_first_install_cannot_be_used_as_a_return_target(self):
+        binding = {'operationId': str(uuid.uuid4()), 'planSha256': '2' * 64, 'targetDigest': 'sha256:' + '3' * 64}
+        with self.assertRaisesRegex(activate.ActivationError, 'existing healthy'):
+            self.run_activation(retain=binding)
+        self.assertEqual(self.systemd.events, [])
+        self.assertFalse((self.install / 'current').exists())
+        self.run_activation()
+        ticket = {'schema': 'orbis-sentinel.upgrade-retention-ticket.v1', 'activationId': self.journal()['id'],
+                  'sha256': '4' * 64, 'binding': binding}
+        self.systemd.events.clear()
+        with self.assertRaises(activate.RecoveryRequired):
+            self.run_restoration(ticket)
+        self.assertEqual(self.systemd.events, [])
+
+    def test_retention_rejects_invalid_bindings_before_creating_installation(self):
+        valid = {'operationId': str(uuid.uuid4()), 'planSha256': '2' * 64, 'targetDigest': 'sha256:' + '3' * 64}
+        for field, item in [('operationId', str(uuid.uuid5(uuid.NAMESPACE_DNS, 'sentinel.invalid'))),
+                            ('operationId', valid['operationId'].upper()),
+                            ('planSha256', False), ('planSha256', 'g' * 64), ('targetDigest', '3' * 64)]:
+            with self.subTest(field=field, item=item), self.assertRaises(activate.ActivationError):
+                self.run_activation(retain={**valid, field: item})
+        self.assertFalse(self.install.exists())
+
+    def test_tampered_ticket_and_changed_retention_never_stop_the_collector(self):
+        ticket = self.retained_update()
+        for changed in ({**ticket, 'sha256': '0' * 64}, {**ticket, 'activationId': '../activation'},
+                        {**ticket, 'binding': {**ticket['binding'], 'operationId': str(uuid.uuid4())}},
+                        {**ticket, 'binding': {**ticket['binding'], 'targetDigest': 'sha256:' + '4' * 64}},
+                        {**ticket, 'force': True}):
+            with self.subTest(changed=changed), self.assertRaises(activate.ActivationError):
+                self.run_restoration(changed)
+            self.assertEqual(self.systemd.events, [])
+        path = self.state / ('retention-' + ticket['activationId'] + '.json')
+        body = path.read_bytes()
+        path.write_bytes(body + b' ')
+        with self.assertRaises(activate.RecoveryRequired):
+            self.run_restoration(ticket)
+        self.assertEqual(path.read_bytes(), body + b' ')
+        self.assertEqual(self.systemd.events, [])
+
+    def test_changed_old_runtime_or_current_selector_is_preserved_without_return_effects(self):
+        ticket = self.retained_update()
+        runtime = self.install / 'releases/0.1.0-dev.10/src/orbis_sentinel/__init__.py'
+        before = runtime.read_bytes()
+        runtime.write_bytes(before + b'\n')
+        with self.assertRaises(ValueError):
+            self.run_restoration(ticket)
+        self.assertEqual(self.systemd.events, [])
+        runtime.write_bytes(before)
+        (self.install / 'current').unlink()
+        (self.install / 'current').symlink_to('releases/0.1.0-dev.10')
+        with self.assertRaises(activate.RecoveryRequired):
+            self.run_restoration(ticket)
+        self.assertEqual(self.systemd.events, [])
+
+    def test_a_later_same_version_activation_also_prevents_old_ticket_restoration(self):
+        ticket = self.retained_update()
+        self.run_activation(self.build('0.1.0-dev.11'))
+        self.systemd.events.clear()
+        with self.assertRaises(activate.RecoveryRequired):
+            self.run_restoration(ticket)
+        self.assertEqual(self.systemd.events, [])
+
+    def test_return_failure_preserves_uncertain_intent_and_refuses_replay(self):
+        ticket = self.retained_update()
+        self.fail_health_version = '0.1.0-dev.10'
+        with self.assertRaises(activate.RecoveryRequired):
+            self.run_restoration(ticket)
+        self.assertEqual(self.journal()['phase'], 'recovery-required')
+        self.systemd.events.clear()
+        self.fail_health_version = None
+        with self.assertRaises(activate.RecoveryRequired):
+            self.run_restoration(ticket)
+        self.assertEqual(self.systemd.events, [])
+        with self.assertRaises(activate.RecoveryRequired):
+            self.run_activation(self.build('0.1.0-dev.12'))
+        self.assertEqual(self.systemd.events, [])
+
+    def test_uncertain_service_quiescence_preserves_selector_and_requires_reconciliation(self):
+        ticket = self.retained_update()
+        self.systemd.fail_quiescence = True
+        with self.assertRaises(activate.RecoveryRequired):
+            self.run_restoration(ticket)
+        self.assertEqual((self.install / 'current').readlink().as_posix(), 'releases/0.1.0-dev.11')
+        self.assertEqual(self.journal()['phase'], 'recovery-required')
+        self.systemd.events.clear()
+        self.systemd.fail_quiescence = False
+        with self.assertRaises(activate.RecoveryRequired):
+            self.run_restoration(ticket)
+        self.assertEqual(self.systemd.events, [])
+
+    def test_unhealthy_current_collector_cannot_start_a_new_return_transaction(self):
+        ticket = self.retained_update()
+        before = (self.state / 'activation.json').read_bytes()
+        self.fail_health_version = '0.1.0-dev.11'
+        with self.assertRaises(activate.ActivationError):
+            self.run_restoration(ticket)
+        self.assertEqual((self.state / 'activation.json').read_bytes(), before)
+        self.assertEqual(list(self.state.glob('restoration-*')), [])
+        self.assertEqual(self.systemd.events, [])
+
+    def test_return_uses_the_normal_exclusive_activation_lock(self):
+        ticket = self.retained_update()
+        descriptor = os.open(self.state / 'activation.lock', os.O_RDWR)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            with self.assertRaises(BlockingIOError):
+                self.run_restoration(ticket)
+        finally:
+            os.close(descriptor)
+        self.assertEqual(self.systemd.events, [])
+
+    def test_changed_managed_receipts_and_units_are_preserved_without_return_effects(self):
+        ticket = self.retained_update()
+        paths = [self.state / ('admission-' + ticket['activationId'] + '.json'),
+                 self.state / 'installed.json', self.state / 'activation.json',
+                 self.units / 'orbis-sentinel.service']
+        for path in paths:
+            original = path.read_bytes()
+            changed = original.replace(b'complete', b'prepared') if path.name == 'activation.json' else original + b' '
+            path.write_bytes(changed)
+            with self.subTest(name=path.name), self.assertRaises(activate.ActivationError):
+                self.run_restoration(ticket)
+            self.assertEqual(path.read_bytes(), changed)
+            self.assertEqual(self.systemd.events, [])
+            path.write_bytes(original)
+
+    def test_unprotected_or_symlinked_retention_cannot_authorize_return(self):
+        ticket = self.retained_update()
+        path = self.state / ('retention-' + ticket['activationId'] + '.json')
+        path.chmod(0o644)
+        with self.assertRaises(activate.ActivationError):
+            self.run_restoration(ticket)
+        path.chmod(0o600)
+        held = self.state / 'held-retention.json'
+        path.rename(held)
+        path.symlink_to(held.name)
+        with self.assertRaises(OSError):
+            self.run_restoration(ticket)
+        self.assertTrue(path.is_symlink())
+        self.assertTrue(held.is_file())
+        self.assertEqual(self.systemd.events, [])
+
+    def test_observer_profile_must_be_restored_separately_before_collector_return(self):
+        self.run_activation()
+        original_profile = self.managed_observer('orbis-observer-v1')
+        binding = {'operationId': str(uuid.uuid4()), 'planSha256': '2' * 64, 'targetDigest': 'sha256:' + '3' * 64}
+        ticket = self.run_activation(self.build('0.1.0-dev.11'), retain=binding)['retainedRollback']
+        self.managed_observer('orbis-observer-v2')
+        self.systemd.events.clear()
+        with self.assertRaisesRegex(activate.RecoveryRequired, 'original managed observer profile'):
+            self.run_restoration(ticket)
+        self.assertEqual(self.systemd.events, [])
+        self.managed_observer('orbis-observer-v1')
+        self.run_restoration(ticket)
+        self.assertEqual(activate._profile(self.systemd, True)['observerProfile'], original_profile)
+
+    def test_lost_final_receipt_is_held_even_when_old_version_is_already_selected(self):
+        ticket = self.retained_update()
+        write = activate._write
+        fail = True
+
+        def write_with_lost_completion(parent, name, body, *args):
+            nonlocal fail
+            if fail and name == 'activation.json' and json.loads(body)['phase'] == 'complete':
+                fail = False
+                raise OSError('Synthetic lost completion write')
+            return write(parent, name, body, *args)
+
+        with mock.patch.object(activate, '_write', write_with_lost_completion), self.assertRaises(activate.RecoveryRequired):
+            self.run_restoration(ticket)
+        self.assertEqual(self.journal()['phase'], 'recovery-required')
+        self.assertEqual(json.loads((self.state / 'installed.json').read_bytes())['version'], '0.1.0-dev.10')
+        self.systemd.events.clear()
+        with self.assertRaises(activate.RecoveryRequired):
+            self.run_restoration(ticket)
+        self.assertEqual(self.systemd.events, [])
 
     def test_orphan_observer_receipt_is_not_silently_dropped(self):
         self.run_activation()
@@ -677,6 +916,8 @@ class OperatorTests(unittest.TestCase):
                     mock.patch.object(activate.os, 'geteuid', return_value=effective):
                 with self.assertRaises(activate.ActivationError):
                     activate._operator()
+                with self.assertRaisesRegex(activate.ActivationError, 'Linux root operator'):
+                    activate.restore_retained(None)
 
 
 if __name__ == '__main__':

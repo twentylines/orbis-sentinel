@@ -162,6 +162,31 @@ def _encoded(value):
     return (json.dumps(value, sort_keys=True, separators=(',', ':')) + '\n').encode()
 
 
+def _retention_binding(value):
+    if (type(value) is not dict or set(value) != {'operationId', 'planSha256', 'targetDigest'}
+            or type(value['operationId']) is not str
+            or type(value['planSha256']) is not str or not SHA256.fullmatch(value['planSha256'])
+            or type(value['targetDigest']) is not str or not value['targetDigest'].startswith('sha256:')
+            or not SHA256.fullmatch(value['targetDigest'][7:])):
+        raise ActivationError('Sentinel retention requires an exact coordinated operation binding')
+    try:
+        operation = uuid.UUID(value['operationId'])
+    except ValueError as error:
+        raise ActivationError('Sentinel retention operation is invalid') from error
+    if operation.version != 4 or str(operation) != value['operationId']:
+        raise ActivationError('Sentinel retention operation is invalid')
+    return dict(value)
+
+
+def _retention_ticket(record, binding):
+    value = {'schema': 'orbis-sentinel.upgrade-retention.v1', 'binding': binding,
+             'activation': {**record, 'phase': 'prepared'}}
+    body = _encoded(value)
+    return body, {'schema': 'orbis-sentinel.upgrade-retention-ticket.v1',
+                  'activationId': record['id'], 'sha256': hashlib.sha256(body).hexdigest(),
+                  'binding': dict(binding)}
+
+
 def _version_order(version):
     core, separator, suffix = version.partition('-')
     numbers = core.split('.')
@@ -465,8 +490,9 @@ def _ready(systemd, version, timeout=15):
             time.sleep(0.1)
 
 
-def activate_release(artifact, bundle, workspace, *, sha256, version, source_commit, verifier):
+def activate_release(artifact, bundle, workspace, *, sha256, version, source_commit, verifier, retain=None):
     _operator()
+    binding = _retention_binding(retain) if retain is not None else None
     if (not isinstance(version, str) or len(version) > 128 or not VERSION.fullmatch(version)
             or not isinstance(sha256, str) or not SHA256.fullmatch(sha256)
             or not isinstance(source_commit, str) or not COMMIT.fullmatch(source_commit)):
@@ -523,6 +549,10 @@ def activate_release(artifact, bundle, workspace, *, sha256, version, source_com
             unit_bytes[name] = body
         systemd = Systemd()
         previous_units = _profile(systemd, installed is not None)
+        if binding is not None:
+            if (installed is None or not all(previous_units[name]['active'] for name in UNIT_HASHES)):
+                raise ActivationError('Coordinated retention requires an existing healthy Sentinel installation')
+            _ready(systemd, installed['version'])
         verified = verify_release(artifact, bundle, ROOT / 'releases', workspace,
             sha256=sha256, version=version, source_commit=source_commit, verifier=verifier, reuse_existing=True)
         if verified.get('publisherVerified') is not True or verified.get('activated') is not False:
@@ -553,6 +583,10 @@ def activate_release(artifact, bundle, workspace, *, sha256, version, source_com
             _write(state, 'activation.json', body, 0o600, journal)
             journal = body
         persist('prepared')
+        retention = None
+        if binding is not None:
+            retained_body, retention = _retention_ticket(record, binding)
+            _write(state, 'retention-' + record['id'] + '.json', retained_body, 0o600)
         # Keep an immutable admission record even when the current journal advances.
         _write(state, 'admission-' + record['id'] + '.json', journal, 0o600)
         selected = previous_selector
@@ -582,7 +616,8 @@ def activate_release(artifact, bundle, workspace, *, sha256, version, source_com
             _write(state, 'installed.json', receipt_bytes, 0o600, installed_bytes)
             persist('complete')
             return {**verified, 'activated': True, 'previousVersion': installed['version'] if installed else None,
-                    'activationId': record['id'], 'retainedVersionsRemoved': 0}
+                    'activationId': record['id'], 'retainedVersionsRemoved': 0,
+                    **({'retainedRollback': retention} if retention is not None else {})}
         except BaseException as original:
             try:
                 if isinstance(original, RecoveryRequired):
@@ -631,6 +666,160 @@ def activate_release(artifact, bundle, workspace, *, sha256, version, source_com
                     pass
                 raise RecoveryRequired('Sentinel activation needs independent reconciliation; retained versions and journal were preserved') from failure
             raise ActivationError('Sentinel activation failed and the previous configuration was restored') from original
+    finally:
+        if lock is not None:
+            os.close(lock)
+        for parent in reversed(parents):
+            parent.close()
+
+
+def restore_retained(ticket):
+    """Return only the most recently completed, explicitly retained activation.
+
+    This Linux Root API has no version/path/force option. Its ticket identifies
+    an immutable admission created by activate_release, not caller observations.
+    Uncertain restoration effects require reconciliation instead of replay.
+    """
+    _operator()
+    if (type(ticket) is not dict
+            or set(ticket) != {'schema', 'activationId', 'sha256', 'binding'}
+            or ticket['schema'] != 'orbis-sentinel.upgrade-retention-ticket.v1'
+            or type(ticket['activationId']) is not str or len(ticket['activationId']) != 32
+            or any(character not in '0123456789abcdef' for character in ticket['activationId'])
+            or type(ticket['sha256']) is not str or not SHA256.fullmatch(ticket['sha256'])):
+        raise ActivationError('Sentinel retained activation ticket is invalid')
+    binding = _retention_binding(ticket['binding'])
+    parents, lock = [], None
+    try:
+        for path in (ROOT, STATE, UNITS):
+            parents.append(_Parent(path))
+        root, state, units = parents
+        # Share exactly the normal activation lock. Absence is not permission
+        # to create a new installation or restore unrecorded runtime bytes.
+        lock = os.open('activation.lock', os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=state.fd)
+        identity = os.fstat(lock)
+        if (not stat.S_ISREG(identity.st_mode) or identity.st_uid != os.geteuid()
+                or identity.st_nlink != 1 or stat.S_IMODE(identity.st_mode) != 0o600):
+            raise ActivationError('Sentinel activation lock is not protected')
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if _seal(os.stat('activation.lock', dir_fd=state.fd, follow_symlinks=False)) != _seal(identity):
+            raise ActivationError('Sentinel activation lock changed')
+        retained = _read(state, 'retention-' + ticket['activationId'] + '.json', 0o600)
+        if retained is None or hashlib.sha256(retained).hexdigest() != ticket['sha256']:
+            raise RecoveryRequired('The retained Sentinel admission changed or is unavailable')
+        value = _json(retained)
+        if (type(value) is not dict or set(value) != {'schema', 'binding', 'activation'}
+                or value['schema'] != 'orbis-sentinel.upgrade-retention.v1' or value['binding'] != binding):
+            raise RecoveryRequired('The retained Sentinel operation differs from its ticket')
+        original = value['activation']
+        if (type(original) is not dict
+                or set(original) != {'schema', 'id', 'phase', 'candidate', 'previous', 'previousUnits'}
+                or original['schema'] != 'orbis-sentinel.activation.v1' or original['phase'] != 'prepared'
+                or original['id'] != ticket['activationId'] or original['previous'] is None
+                or _retention_ticket(original, binding) != (retained, ticket)
+                or _read(state, 'admission-' + original['id'] + '.json', 0o600) != _encoded(original)):
+            raise RecoveryRequired('The retained Sentinel activation lacks its exact original admission')
+        candidate, previous = _receipt(original['candidate']), _receipt(original['previous'])
+        desired = original['previousUnits']
+        if (type(desired) is not dict or set(desired) not in (set(UNIT_HASHES), {*UNIT_HASHES, 'observerProfile'})
+                or any(type(desired[name]) is not dict or set(desired[name]) != {'active', 'enabled'}
+                       or any(type(item) is not bool for item in desired[name].values())
+                       or not desired[name]['active'] for name in UNIT_HASHES)):
+            raise RecoveryRequired('The retained Sentinel unit observations require review')
+        for name, digest in UNIT_HASHES.items():
+            body = _read(units, name, 0o644)
+            if body is None or hashlib.sha256(body).hexdigest() != digest:
+                raise RecoveryRequired('Sentinel unit bytes changed before retained restoration')
+        systemd = Systemd()
+        observed = _profile(systemd, True)
+        if observed.get('observerProfile') != desired.get('observerProfile'):
+            raise RecoveryRequired('Restore the original managed observer profile before returning Sentinel')
+        current = _read(state, 'activation.json', 0o600)
+        installed = _read(state, 'installed.json', 0o600)
+        selected = _selector(root)
+        restoration_name = 'restoration-' + original['id'] + '.json'
+        restoration = _read(state, restoration_name, 0o600)
+        if restoration is not None:
+            saved = _json(restoration)
+            if (type(saved) is not dict or set(saved) != {'schema', 'ticket', 'activation'}
+                    or saved['schema'] != 'orbis-sentinel.retained-restoration.v1' or saved['ticket'] != ticket):
+                raise RecoveryRequired('The Sentinel restoration receipt requires review')
+            record = saved['activation']
+            if (type(record) is not dict or set(record) != set(original)
+                    or type(record.get('id')) is not str or len(record['id']) != 32
+                    or any(character not in '0123456789abcdef' for character in record['id'])
+                    or record['id'] == original['id']
+                    or record != {**original, 'id': record['id'], 'candidate': previous, 'previous': candidate,
+                                  'previousUnits': record['previousUnits']}
+                    or _read(state, 'admission-' + record['id'] + '.json', 0o600) != _encoded(record)
+                    or current != _encoded({**record, 'phase': 'complete'})
+                    or installed != _encoded(previous)
+                    or (selected or {}).get('target') != 'releases/' + previous['version'] or observed != desired):
+                raise RecoveryRequired('An interrupted or superseded Sentinel restoration cannot be replayed')
+            _ready(systemd, previous['version'])
+            return {'restored': True, 'activationId': record['id'], 'restoredActivationId': original['id'],
+                    'version': previous['version'], 'retainedVersionsRemoved': 0}
+        if (current != _encoded({**original, 'phase': 'complete'}) or installed != _encoded(candidate)
+                or (selected or {}).get('target') != 'releases/' + candidate['version']
+                or any(not all(observed[name].values()) for name in UNIT_HASHES)):
+            raise RecoveryRequired('Only the current completed retained Sentinel activation can be restored')
+        _ready(systemd, candidate['version'])
+        result_name = 'result-' + original['id'] + '.json'
+        archived = _read(state, result_name, 0o600)
+        if archived is None:
+            _write(state, result_name, current, 0o600)
+        elif archived != current:
+            raise RecoveryRequired('The original Sentinel activation outcome changed')
+        record = {**original, 'id': uuid.uuid4().hex, 'candidate': previous,
+                  'previous': candidate, 'previousUnits': observed}
+        _write(state, restoration_name, _encoded({'schema': 'orbis-sentinel.retained-restoration.v1',
+                                                'ticket': ticket, 'activation': record}), 0o600)
+        journal = current
+
+        def persist(phase):
+            nonlocal journal
+            record['phase'] = phase
+            body = _encoded(record)
+            _write(state, 'activation.json', body, 0o600, journal)
+            journal = body
+
+        persist('prepared')
+        _write(state, 'admission-' + record['id'] + '.json', journal, 0o600)
+        try:
+            # Durable intent precedes every service/selector effect. A failure
+            # here remains visible and never authorizes another stop/select.
+            persist('activating')
+            for parent in parents:
+                parent.assert_current()
+            if (_read(state, 'installed.json', 0o600) != installed or _selector(root) != selected
+                    or _receipt(candidate) != candidate or _receipt(previous) != previous
+                    or _profile(systemd, True) != observed):
+                raise RecoveryRequired('Sentinel identity changed before retained restoration')
+            systemd.stop()
+            selected = _select(root, 'releases/' + previous['version'], selected)
+            for name in UNIT_HASHES:
+                systemd.run('enable' if desired[name]['enabled'] else 'disable', name)
+            systemd.run('daemon-reload')
+            for name in reversed(tuple(UNIT_HASHES)):
+                systemd.run('start', name)
+            _ready(systemd, previous['version'])
+            if (_profile(systemd, True) != desired or _selector(root) != selected
+                    or _receipt(previous) != previous or _receipt(candidate) != candidate):
+                raise RecoveryRequired('Restored Sentinel identity changed during startup')
+            for name, digest in UNIT_HASHES.items():
+                body = _read(units, name, 0o644)
+                if body is None or hashlib.sha256(body).hexdigest() != digest:
+                    raise RecoveryRequired('Sentinel units changed during retained restoration')
+            _write(state, 'installed.json', _encoded(previous), 0o600, installed)
+            persist('complete')
+            return {'restored': True, 'activationId': record['id'], 'restoredActivationId': original['id'],
+                    'version': previous['version'], 'retainedVersionsRemoved': 0}
+        except BaseException as error:
+            try:
+                persist('recovery-required')
+            except (OSError, ValueError):
+                pass
+            raise RecoveryRequired('Sentinel retained restoration needs reconciliation; no effect may be replayed') from error
     finally:
         if lock is not None:
             os.close(lock)
