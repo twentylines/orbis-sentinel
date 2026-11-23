@@ -138,13 +138,14 @@ class ActivationTests(unittest.TestCase):
         if version == self.fail_health_version:
             raise activate.ActivationError('Synthetic wrong health identity')
 
-    def run_activation(self, package=None, *, retain=None):
+    def run_activation(self, package=None, *, retain=None, activation_lock_fd=None):
         self.systemd.__dict__.pop('_orbis_observer_profile', None)
         self.sequence += 1
         package = package or self.package
         return activate.activate_release(Path(package['artifact']), self.bundle,
             self.root / ('verify-' + str(self.sequence)), sha256=package['sha256'],
-            version=package['version'], source_commit='1' * 40, verifier=self.tool, retain=retain)
+            version=package['version'], source_commit='1' * 40, verifier=self.tool, retain=retain,
+            activation_lock_fd=activation_lock_fd)
 
     def retained_update(self):
         self.run_activation()
@@ -360,6 +361,48 @@ class ActivationTests(unittest.TestCase):
         finally:
             os.close(descriptor)
         self.assertEqual(self.systemd.events, [])
+
+    def test_parent_lease_spans_retained_update_return_and_health_failure(self):
+        self.run_activation()
+        descriptor = os.open(self.state / 'activation.lock', os.O_RDWR)
+        competing = os.open(self.state / 'activation.lock', os.O_RDWR)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            binding = {'operationId': str(uuid.uuid4()), 'planSha256': '2' * 64,
+                       'targetDigest': 'sha256:' + '3' * 64}
+            updated = self.run_activation(self.build('0.1.0-dev.11'), retain=binding,
+                                          activation_lock_fd=descriptor)
+            with self.assertRaises(BlockingIOError):
+                fcntl.flock(competing, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.systemd.__dict__.pop('_orbis_observer_profile', None)
+            restored = activate.restore_retained(updated['retainedRollback'], activation_lock_fd=descriptor)
+            self.assertTrue(restored['restored'])
+            with self.assertRaises(BlockingIOError):
+                self.run_activation()
+            self.fail_health_version = '0.1.0-dev.11'
+            with self.assertRaises(activate.ActivationError):
+                self.run_activation(self.build('0.1.0-dev.11'), activation_lock_fd=descriptor)
+            self.assertEqual(self.journal()['phase'], 'rolled-back')
+            with self.assertRaises(BlockingIOError):
+                fcntl.flock(competing, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(descriptor)
+            os.close(competing)
+
+    def test_foreign_lease_refuses_activation_and_return_before_supervisor_effects(self):
+        ticket = self.retained_update()
+        foreign = self.root / 'foreign.lock'
+        descriptor = os.open(foreign, os.O_CREAT | os.O_RDWR, 0o600)
+        before = (self.state / 'activation.json').read_bytes()
+        try:
+            with self.assertRaises(activate.ActivationError):
+                self.run_activation(activation_lock_fd=descriptor)
+            with self.assertRaises(activate.ActivationError):
+                activate.restore_retained(ticket, activation_lock_fd=descriptor)
+        finally:
+            os.close(descriptor)
+        self.assertEqual(self.systemd.events, [])
+        self.assertEqual((self.state / 'activation.json').read_bytes(), before)
 
     def test_changed_managed_receipts_and_units_are_preserved_without_return_effects(self):
         ticket = self.retained_update()

@@ -60,6 +60,9 @@ PROPERTIES = ('LoadState', 'ActiveState', 'SubState', 'FragmentPath', 'DropInPat
               'ControlGroup', 'InvocationID')
 TERMINAL = {'complete', 'rolled-back'}
 LIMIT = 2 * 1024 * 1024
+ACTIVATION_LEASE_PROTOCOL = 'orbis-sentinel.activation-lease.v1'
+OBSERVER_CHANGE_PROTOCOL = 'orbis-sentinel.observer-change.v1'
+SYSTEMD_SYSUSERS = Path('/usr/bin/systemd-sysusers')
 
 
 class ActivationError(ValueError):
@@ -490,7 +493,42 @@ def _ready(systemd, version, timeout=15):
             time.sleep(0.1)
 
 
-def activate_release(artifact, bundle, workspace, *, sha256, version, source_commit, verifier, retain=None):
+def _activation_lock(state, inherited, *, create=False):
+    """Own a descriptor, never unlock another process's continued lease.
+
+    An inherited descriptor conveys serialization only. It does not replace
+    operator, publisher, profile, health or retained-admission validation.
+    Closing our duplicate leaves the parent's open-file-description lock held.
+    """
+    state.assert_current()
+    if inherited is None:
+        flags = os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+        descriptor = os.open('activation.lock', flags | (os.O_CREAT if create else 0),
+                             0o600, dir_fd=state.fd)
+    else:
+        if type(inherited) is not int or inherited < 3:
+            raise ActivationError('Sentinel activation lease descriptor is invalid')
+        descriptor = os.dup(inherited)
+    try:
+        identity = os.fstat(descriptor)
+        if (not stat.S_ISREG(identity.st_mode) or identity.st_uid != os.geteuid()
+                or identity.st_nlink != 1 or stat.S_IMODE(identity.st_mode) != 0o600
+                or fcntl.fcntl(descriptor, fcntl.F_GETFL) & os.O_ACCMODE != os.O_RDWR):
+            raise ActivationError('Sentinel activation lock is not protected')
+        if _seal(os.stat('activation.lock', dir_fd=state.fd, follow_symlinks=False)) != _seal(identity):
+            raise ActivationError('Sentinel activation lock changed')
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        state.assert_current()
+        if _seal(os.stat('activation.lock', dir_fd=state.fd, follow_symlinks=False)) != _seal(identity):
+            raise ActivationError('Sentinel activation lock changed')
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def activate_release(artifact, bundle, workspace, *, sha256, version, source_commit, verifier, retain=None,
+                     activation_lock_fd=None):
     _operator()
     binding = _retention_binding(retain) if retain is not None else None
     if (not isinstance(version, str) or len(version) > 128 or not VERSION.fullmatch(version)
@@ -507,13 +545,7 @@ def activate_release(artifact, bundle, workspace, *, sha256, version, source_com
         for path in (ROOT, STATE, UNITS):
             parents.append(_Parent(path))
         root, state, units = parents
-        lock = os.open('activation.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=state.fd)
-        identity = os.fstat(lock)
-        if not stat.S_ISREG(identity.st_mode) or identity.st_uid != os.geteuid() or identity.st_nlink != 1 or stat.S_IMODE(identity.st_mode) != 0o600:
-            raise ActivationError('Sentinel activation lock is not protected')
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        if _seal(os.stat('activation.lock', dir_fd=state.fd, follow_symlinks=False)) != _seal(identity):
-            raise ActivationError('Sentinel activation lock changed')
+        lock = _activation_lock(state, activation_lock_fd, create=True)
         current_journal = _read(state, 'activation.json', 0o600)
         prior = None
         if current_journal is not None:
@@ -673,7 +705,7 @@ def activate_release(artifact, bundle, workspace, *, sha256, version, source_com
             parent.close()
 
 
-def restore_retained(ticket):
+def restore_retained(ticket, *, activation_lock_fd=None):
     """Return only the most recently completed, explicitly retained activation.
 
     This Linux Root API has no version/path/force option. Its ticket identifies
@@ -696,14 +728,7 @@ def restore_retained(ticket):
         root, state, units = parents
         # Share exactly the normal activation lock. Absence is not permission
         # to create a new installation or restore unrecorded runtime bytes.
-        lock = os.open('activation.lock', os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=state.fd)
-        identity = os.fstat(lock)
-        if (not stat.S_ISREG(identity.st_mode) or identity.st_uid != os.geteuid()
-                or identity.st_nlink != 1 or stat.S_IMODE(identity.st_mode) != 0o600):
-            raise ActivationError('Sentinel activation lock is not protected')
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        if _seal(os.stat('activation.lock', dir_fd=state.fd, follow_symlinks=False)) != _seal(identity):
-            raise ActivationError('Sentinel activation lock changed')
+        lock = _activation_lock(state, activation_lock_fd)
         retained = _read(state, 'retention-' + ticket['activationId'] + '.json', 0o600)
         if retained is None or hashlib.sha256(retained).hexdigest() != ticket['sha256']:
             raise RecoveryRequired('The retained Sentinel admission changed or is unavailable')
@@ -825,6 +850,440 @@ def restore_retained(ticket):
             os.close(lock)
         for parent in reversed(parents):
             parent.close()
+
+
+def _observer_paths():
+    return {'collector': UNITS / 'orbis-sentinel.service.d/observer.conf',
+            'host': UNITS / 'orbis-host.service.d/sentinel-observer.conf',
+            'socket': UNITS / 'orbis-host-observer.socket',
+            'sysusers': SYSUSERS / 'orbis-sentinel-observer.conf'}
+
+
+def _observer_bodies(version):
+    base = ROOT / 'releases' / version / 'packaging'
+    sources = {'collector': base / 'systemd/observer-profiles/upgrade-observer.conf',
+               'host': base / 'systemd/orbis-host.service.d/sentinel-observer.conf',
+               'socket': base / 'systemd/orbis-host-observer.socket',
+               'sysusers': base / 'sysusers.d/orbis-sentinel-observer.conf'}
+    bodies = {}
+    for role, source in sources.items():
+        with closing(_Parent(source.parent)) as parent:
+            body = _read(parent, source.name, 0o644, 4096)
+        if body is None or hashlib.sha256(body).hexdigest() != OBSERVER_PROFILES['orbis-observer-v2'][role]:
+            raise ActivationError('The verified release lacks its exact upgrade observer profile')
+        bodies[role] = body
+    return bodies
+
+
+def _current_retention(root, state, ticket):
+    if (type(ticket) is not dict or set(ticket) != {'schema', 'activationId', 'sha256', 'binding'}
+            or ticket['schema'] != 'orbis-sentinel.upgrade-retention-ticket.v1'
+            or type(ticket['activationId']) is not str or len(ticket['activationId']) != 32
+            or any(item not in '0123456789abcdef' for item in ticket['activationId'])
+            or type(ticket['sha256']) is not str or not SHA256.fullmatch(ticket['sha256'])):
+        raise ActivationError('An exact retained Sentinel activation is required for observer changes')
+    binding = _retention_binding(ticket['binding'])
+    body = _read(state, 'retention-' + ticket['activationId'] + '.json', 0o600)
+    if body is None or hashlib.sha256(body).hexdigest() != ticket['sha256']:
+        raise RecoveryRequired('The retained observer activation changed')
+    value = _json(body)
+    if (type(value) is not dict or set(value) != {'schema', 'binding', 'activation'}
+            or value['schema'] != 'orbis-sentinel.upgrade-retention.v1' or value['binding'] != binding):
+        raise RecoveryRequired('The observer activation belongs to another operation')
+    original = value['activation']
+    if (type(original) is not dict
+            or set(original) != {'schema', 'id', 'phase', 'candidate', 'previous', 'previousUnits'}
+            or original['schema'] != 'orbis-sentinel.activation.v1' or original['phase'] != 'prepared'
+            or original['id'] != ticket['activationId'] or original['previous'] is None
+            or _retention_ticket(original, binding) != (body, ticket)
+            or _read(state, 'admission-' + original['id'] + '.json', 0o600) != _encoded(original)
+            or _read(state, 'activation.json', 0o600) != _encoded({**original, 'phase': 'complete'})
+            or _read(state, 'installed.json', 0o600) != _encoded(original['candidate'])):
+        raise RecoveryRequired('The observer requires the current completed retained activation')
+    installed = _receipt(original['candidate'])
+    if (_selector(root) or {}).get('target') != 'releases/' + installed['version']:
+        raise RecoveryRequired('The observer Sentinel selector changed')
+    return installed
+
+
+def _observer_host(systemd, profile, *, pending=False):
+    observed = systemd.inspect('orbis-host.service')
+    drop_in = str(_observer_paths()['host']) if profile is not None else ''
+    if (observed.get('LoadState') != 'loaded'
+            or observed.get('FragmentPath') != str(UNITS / 'orbis-host.service')
+            or observed.get('DropInPaths') != drop_in
+            or observed.get('NeedDaemonReload') not in ({'no', 'yes'} if pending else {'no'})
+            or observed.get('KillMode') != 'control-group' or observed.get('ControlPID') != '0'
+            or observed.get('ActiveState') != 'active' or observed.get('SubState') != 'running'
+            or observed.get('ControlGroup') != '/system.slice/orbis-host.service'
+            or not str(observed.get('MainPID', '')).isascii()
+            or not str(observed.get('MainPID', '')).isdecimal() or int(observed['MainPID']) <= 0
+            or type(observed.get('InvocationID')) is not str or len(observed['InvocationID']) != 32
+            or any(item not in '0123456789abcdef' for item in observed['InvocationID'])):
+        raise RecoveryRequired('The live Host observer identity requires review')
+    return {key: observed[key] for key in ('MainPID', 'InvocationID', 'ControlGroup')}
+
+
+def _observer_socket(systemd, active):
+    value = systemd.inspect('orbis-host-observer.socket')
+    if (value.get('ActiveState') != ('active' if active else 'inactive')
+            or value.get('SubState') != ('listening' if active else 'dead')
+            or value.get('ControlPID') != '0'
+            or (active and (value.get('LoadState') != 'loaded'
+                or value.get('FragmentPath') != str(_observer_paths()['socket'])
+                or value.get('DropInPaths') != '' or value.get('NeedDaemonReload') != 'no'))):
+        raise RecoveryRequired('The Host observer socket has not reached its expected state')
+
+
+def _observer_files():
+    result = {}
+    for role, path in _observer_paths().items():
+        if not path.parent.exists() and not path.parent.is_symlink():
+            body = None
+        else:
+            with closing(_Parent(path.parent)) as parent:
+                if role in ('collector', 'host') and set(os.listdir(parent.fd)) - {path.name}:
+                    raise ActivationError('The observer has unmanaged drop-in files')
+                body = _read(parent, path.name, 0o644, 4096)
+        result[role] = None if body is None else body.hex()
+    return result
+
+
+def _observer_group(state, original, *, record=False):
+    try:
+        group = grp.getgrnam('orbis-observer').gr_gid
+    except KeyError:
+        group = None
+    receipt = _read(state, 'observer-group.json', 0o600, 4096)
+    if group is not None and (type(group) is not int or not 0 < group < 2**31):
+        raise ActivationError('The observer group identity requires review')
+    value = None if group is None else {'schema': 'orbis-sentinel.observer-group.v1',
+                                      'name': 'orbis-observer', 'groupId': group}
+    if receipt is not None and (value is None or receipt != _encoded(value)):
+        raise RecoveryRequired('The managed observer group changed')
+    if original is None and group is not None and receipt is None and not record:
+        raise ActivationError('An existing unmanaged observer group cannot be adopted')
+    if original is not None and group != original['groupId']:
+        raise RecoveryRequired('The enrolled observer group changed')
+    if record:
+        if value is None:
+            raise RecoveryRequired('The supervisor did not create the observer group')
+        if receipt is None:
+            _write(state, 'observer-group.json', _encoded(value), 0o600)
+    return group
+
+
+def _observer_sysusers(path):
+    with closing(_Parent(SYSTEMD_SYSUSERS.parent)) as parent:
+        info = SYSTEMD_SYSUSERS.lstat()
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o7022
+                or not info.st_mode & 0o111):
+            raise ActivationError('The system user supervisor is not trusted')
+        result = subprocess.run([str(SYSTEMD_SYSUSERS), str(path)], stdin=subprocess.DEVNULL,
+            capture_output=True, timeout=20, env={'PATH': os.defpath})
+        parent.assert_current()
+        if _seal(SYSTEMD_SYSUSERS.lstat()) != _seal(info) or result.returncode or len(result.stdout) + len(result.stderr) > 65536:
+            raise RecoveryRequired('The supervisor did not confirm the observer group')
+
+
+def prepare_observer_profile(ticket, *, activation_lock_fd):
+    """Prepare the fixed profile and group before starting independent progress.
+
+    Requires the actual current retained activation and the coordinator's held
+    activation lock. No recovery enrollment, Host replacement or Core effects.
+    """
+    _operator()
+    if activation_lock_fd is None:
+        raise ActivationError('The whole-transaction activation lease is required')
+    with closing(_Parent(ROOT)) as root, closing(_Parent(STATE)) as state:
+        lock = _activation_lock(state, activation_lock_fd)
+        try:
+            installed = _current_retention(root, state, ticket)
+            bodies = _observer_bodies(installed['version'])
+            systemd = Systemd()
+            current = _profile(systemd, True)
+            _ready(systemd, installed['version'])
+            original = current.get('observerProfile')
+            activation = _json(_read(state, 'activation.json', 0o600))
+            if original != activation['previousUnits'].get('observerProfile'):
+                raise RecoveryRequired('The original observer profile differs from retained activation custody')
+            host = _observer_host(systemd, original)
+            if original is not None:
+                _observer_socket(systemd, True)
+            else:
+                _observer_socket(systemd, False)
+                if systemd.inspect('orbis-host-observer.socket').get('LoadState') != 'not-found':
+                    raise ActivationError('An unmanaged observer socket unit cannot be adopted')
+            original_files = _observer_files()
+            if original is None and any(value is not None for value in original_files.values()):
+                raise ActivationError('Unmanaged observer files cannot be adopted')
+            _observer_group(state, original)
+            prior = _read(state, 'observer-change.json', 0o600, 32768)
+            if prior is not None:
+                previous = _json(prior)
+                if (type(previous) is not dict or previous.get('phase') not in {'complete', 'returned'}
+                        or previous.get('ticket', {}).get('activationId') == ticket['activationId']):
+                    raise RecoveryRequired('A previous observer change requires reconciliation')
+            admission = {'schema': 'orbis-sentinel.observer-admission.v1', 'id': uuid.uuid4().hex,
+                         'retainedActivation': ticket, 'originalProfile': original, 'originalFiles': original_files,
+                         'originalHost': host, 'targetProfile': 'orbis-observer-v2'}
+            admission_body = _encoded(admission)
+            _write(state, 'observer-admission-' + admission['id'] + '.json', admission_body, 0o600)
+            result = {'schema': 'orbis-sentinel.observer-change-ticket.v1', 'id': admission['id'],
+                      'activationId': ticket['activationId'], 'binding': ticket['binding'],
+                      'sha256': hashlib.sha256(admission_body).hexdigest()}
+            record = {'schema': OBSERVER_CHANGE_PROTOCOL, 'ticket': result, 'phase': 'prepared', 'profile': None}
+            def persist(phase):
+                nonlocal prior
+                record['phase'] = phase
+                body = _encoded(record)
+                _write(state, 'observer-change.json', body, 0o600, prior)
+                prior = body
+            persist('prepared')
+            if original is not None and original['profile'] == 'orbis-observer-v2':
+                record['profile'] = original
+                _current_retention(root, state, ticket)
+                persist('complete')
+                return {'ticket': result, 'profile': original, 'prepared': True}
+            try:
+                # All templates and original managed identities were validated
+                # before the first system configuration effect.
+                for role, path in _observer_paths().items():
+                    if not path.parent.exists():
+                        _directory(path.parent, 0o755)
+                    with closing(_Parent(path.parent)) as parent:
+                        previous = None if original_files[role] is None else bytes.fromhex(original_files[role])
+                        _write(parent, path.name, bodies[role], 0o644, previous)
+                _observer_sysusers(_observer_paths()['sysusers'])
+                group = _observer_group(state, original, record=True)
+                profile = {'schema': 'orbis-sentinel.observer-profile.v1', 'profile': 'orbis-observer-v2',
+                           'groupId': group, 'files': dict(OBSERVER_PROFILES['orbis-observer-v2'])}
+                _write(state, 'observer-profile.json', _encoded(profile), 0o600,
+                       None if original is None else _encoded(original))
+                record['profile'] = profile
+                persist('installed')
+                _current_retention(root, state, ticket)
+                return {'ticket': result, 'profile': profile, 'prepared': True}
+            except BaseException:
+                persist('recovery-required')
+                raise
+        finally:
+            os.close(lock)
+
+
+def _observer_admission(state, ticket):
+    if (type(ticket) is not dict or set(ticket) != {'schema', 'id', 'activationId', 'binding', 'sha256'}
+            or ticket['schema'] != 'orbis-sentinel.observer-change-ticket.v1'
+            or type(ticket['id']) is not str or len(ticket['id']) != 32
+            or any(item not in '0123456789abcdef' for item in ticket['id'])
+            or type(ticket['sha256']) is not str or not SHA256.fullmatch(ticket['sha256'])):
+        raise ActivationError('The exact observer change ticket is required')
+    _retention_binding(ticket['binding'])
+    body = _read(state, 'observer-admission-' + ticket['id'] + '.json', 0o600, 32768)
+    if body is None or hashlib.sha256(body).hexdigest() != ticket['sha256']:
+        raise RecoveryRequired('The observer change admission changed')
+    value = _json(body)
+    if (type(value) is not dict or set(value) != {'schema', 'id', 'retainedActivation',
+            'originalProfile', 'originalFiles', 'originalHost', 'targetProfile'}
+            or value['schema'] != 'orbis-sentinel.observer-admission.v1' or value['id'] != ticket['id']
+            or value['targetProfile'] != 'orbis-observer-v2'
+            or value['retainedActivation']['activationId'] != ticket['activationId']
+            or value['retainedActivation']['binding'] != ticket['binding']):
+        raise RecoveryRequired('The observer change belongs to another activation')
+    return value
+
+
+def _observer_pending(systemd, admission, version):
+    if _observer_host(systemd, admission['originalProfile'], pending=True) != admission['originalHost']:
+        raise RecoveryRequired('The original Host changed during observer preparation')
+    expected_drop_in = str(_observer_paths()['collector']) if admission['originalProfile'] is not None else ''
+    for name in UNIT_HASHES:
+        value = systemd.inspect(name)
+        if (value.get('LoadState') != 'loaded' or value.get('FragmentPath') != str(UNITS / name)
+                or value.get('DropInPaths') != (expected_drop_in if name.endswith('.service') else '')
+                or value.get('NeedDaemonReload') not in {'yes', 'no'} or value.get('ActiveState') != 'active'
+                or value.get('ControlPID') != '0'):
+            raise RecoveryRequired('The original collector changed during observer preparation')
+    _health(version, 15)
+
+
+def activate_observer_profile(ticket, *, activation_lock_fd):
+    """Reload only after the parent has started its independent progress socket."""
+    _operator()
+    if activation_lock_fd is None:
+        raise ActivationError('The whole-transaction activation lease is required')
+    with closing(_Parent(ROOT)) as root, closing(_Parent(STATE)) as state:
+        lock = _activation_lock(state, activation_lock_fd)
+        try:
+            admission = _observer_admission(state, ticket)
+            installed = _current_retention(root, state, admission['retainedActivation'])
+            prior = _read(state, 'observer-change.json', 0o600, 32768)
+            record = _json(prior) if prior is not None else None
+            if (type(record) is not dict or set(record) != {'schema', 'ticket', 'phase', 'profile'}
+                    or record['schema'] != OBSERVER_CHANGE_PROTOCOL or record['ticket'] != ticket
+                    or record['phase'] not in {'installed', 'complete'}):
+                raise RecoveryRequired('The prepared observer change requires reconciliation')
+            profile = record['profile']
+            systemd = Systemd()
+            if record['phase'] == 'complete':
+                if _profile(systemd, True).get('observerProfile') != profile:
+                    raise RecoveryRequired('The completed observer profile changed')
+                _observer_host(systemd, profile)
+                _observer_socket(systemd, True)
+                _ready(systemd, installed['version'])
+                return {'ticket': ticket, 'profile': profile, 'enrolled': True}
+            _observer_pending(systemd, admission, installed['version'])
+            expected = {role: body.hex() for role, body in _observer_bodies(installed['version']).items()}
+            if (_observer_files() != expected or _read(state, 'observer-profile.json', 0o600, 8192) != _encoded(profile)
+                    or profile['groupId'] != _observer_group(state, admission['originalProfile'])):
+                raise RecoveryRequired('The prepared observer files or group changed')
+            active = {**record, 'phase': 'activating'}
+            _write(state, 'observer-change.json', _encoded(active), 0o600, prior)
+            try:
+                systemd.run('daemon-reload')
+                systemd.run('start', 'orbis-host-observer.socket')
+                systemd.run('restart', 'orbis-sentinel.service')
+                fresh = Systemd()
+                if (_profile(fresh, True).get('observerProfile') != profile
+                        or _observer_host(fresh, profile) != admission['originalHost']):
+                    raise RecoveryRequired('Observer enrollment must preserve the running Host')
+                _observer_socket(fresh, True)
+                _ready(fresh, installed['version'])
+                _current_retention(root, state, admission['retainedActivation'])
+                _write(state, 'observer-change.json', _encoded({**record, 'phase': 'complete'}), 0o600, _encoded(active))
+                return {'ticket': ticket, 'profile': profile, 'enrolled': True}
+            except BaseException:
+                _write(state, 'observer-change.json', _encoded({**record, 'phase': 'recovery-required'}), 0o600, _encoded(active))
+                raise
+        finally:
+            os.close(lock)
+
+
+def change_observer_profile(ticket, *, activation_lock_fd):
+    """Standalone Root convenience; coordinated updates use the two phases."""
+    prepared = prepare_observer_profile(ticket, activation_lock_fd=activation_lock_fd)
+    return activate_observer_profile(prepared['ticket'], activation_lock_fd=activation_lock_fd)
+
+
+def restore_observer_profile(ticket, *, activation_lock_fd):
+    """Restore only this completed change's exact original managed profile."""
+    _operator()
+    if (activation_lock_fd is None or type(ticket) is not dict
+            or set(ticket) != {'schema', 'id', 'activationId', 'binding', 'sha256'}
+            or ticket['schema'] != 'orbis-sentinel.observer-change-ticket.v1'
+            or type(ticket['id']) is not str or len(ticket['id']) != 32
+            or any(item not in '0123456789abcdef' for item in ticket['id'])
+            or type(ticket['sha256']) is not str or not SHA256.fullmatch(ticket['sha256'])):
+        raise ActivationError('The exact observer return ticket and activation lease are required')
+    _retention_binding(ticket['binding'])
+    with closing(_Parent(ROOT)) as root, closing(_Parent(STATE)) as state:
+        lock = _activation_lock(state, activation_lock_fd)
+        try:
+            body = _read(state, 'observer-admission-' + ticket['id'] + '.json', 0o600, 32768)
+            if body is None or hashlib.sha256(body).hexdigest() != ticket['sha256']:
+                raise RecoveryRequired('The observer return admission changed')
+            admission = _json(body)
+            if (type(admission) is not dict or set(admission) != {'schema', 'id', 'retainedActivation',
+                    'originalProfile', 'originalFiles', 'originalHost', 'targetProfile'}
+                    or admission['schema'] != 'orbis-sentinel.observer-admission.v1' or admission['id'] != ticket['id']
+                    or admission['targetProfile'] != 'orbis-observer-v2'
+                    or admission['retainedActivation']['activationId'] != ticket['activationId']
+                    or admission['retainedActivation']['binding'] != ticket['binding']):
+                raise RecoveryRequired('The observer return belongs to another activation')
+            installed = _current_retention(root, state, admission['retainedActivation'])
+            prior = _read(state, 'observer-change.json', 0o600, 32768)
+            record = _json(prior) if prior is not None else None
+            if (type(record) is not dict or set(record) != {'schema', 'ticket', 'phase', 'profile'}
+                    or record['schema'] != OBSERVER_CHANGE_PROTOCOL or record['ticket'] != ticket
+                    or record['phase'] not in {'installed', 'complete'}):
+                raise RecoveryRequired('The latest observer change is not ready for retained return')
+            profile = record['profile']
+            systemd = Systemd()
+            pending = record['phase'] == 'installed'
+            if pending:
+                _observer_pending(systemd, admission, installed['version'])
+                host = _observer_host(systemd, admission['originalProfile'], pending=True)
+                if (_read(state, 'observer-profile.json', 0o600, 8192) != _encoded(profile)
+                        or profile['groupId'] != _observer_group(state, admission['originalProfile'])):
+                    raise RecoveryRequired('The prepared observer receipt changed')
+            else:
+                if _profile(systemd, True).get('observerProfile') != profile:
+                    raise RecoveryRequired('The active observer profile changed')
+                host = _observer_host(systemd, profile)
+                _observer_socket(systemd, True)
+                _ready(systemd, installed['version'])
+            expected = {role: body.hex() for role, body in _observer_bodies(installed['version']).items()}
+            if _observer_files() != expected:
+                raise RecoveryRequired('The observer return files changed')
+            original = admission['originalProfile']
+            original_files = admission['originalFiles']
+            if type(original_files) is not dict or set(original_files) != set(expected):
+                raise RecoveryRequired('The original observer file inventory is invalid')
+            if original is None:
+                if any(value is not None for value in original_files.values()):
+                    raise RecoveryRequired('The original observer file inventory is invalid')
+            elif (type(original) is not dict or set(original) != {'schema', 'profile', 'groupId', 'files'}
+                    or original['schema'] != 'orbis-sentinel.observer-profile.v1'
+                    or original.get('profile') not in OBSERVER_PROFILES
+                    or original['files'] != OBSERVER_PROFILES[original['profile']]
+                    or original['groupId'] != profile['groupId']
+                    or any(type(value) is not str or len(value) > 8192 for value in original_files.values())
+                    or any(hashlib.sha256(bytes.fromhex(value)).hexdigest() != original['files'][role]
+                           for role, value in original_files.items())):
+                raise RecoveryRequired('The original observer profile inventory is invalid')
+            if original == profile:
+                _write(state, 'observer-change.json', _encoded({**record, 'phase': 'returned'}), 0o600, prior)
+                return {'ticket': ticket, 'profile': original, 'restored': True}
+            _write(state, 'observer-change.json', _encoded({**record, 'phase': 'returning'}), 0o600, prior)
+            try:
+                for role, path in _observer_paths().items():
+                    with closing(_Parent(path.parent)) as parent:
+                        if _read(parent, path.name, 0o644, 4096) != bytes.fromhex(expected[role]):
+                            raise RecoveryRequired('An observer file changed before restoration')
+                        if original_files[role] is None:
+                            os.unlink(path.name, dir_fd=parent.fd)
+                            os.fsync(parent.fd)
+                        else:
+                            _write(parent, path.name, bytes.fromhex(original_files[role]), 0o644, bytes.fromhex(expected[role]))
+                if original is None:
+                    if _read(state, 'observer-profile.json', 0o600, 8192) != _encoded(profile):
+                        raise RecoveryRequired('The current observer receipt changed before restoration')
+                    os.unlink('observer-profile.json', dir_fd=state.fd)
+                    os.fsync(state.fd)
+                else:
+                    _write(state, 'observer-profile.json', _encoded(original), 0o600, _encoded(profile))
+                # Remove the loaded Host dependency before stopping its former
+                # socket; stopping a still-required socket could stop Host too.
+                systemd.run('daemon-reload')
+                if original is None and not pending:
+                    dependencies = systemd.run('show', 'orbis-host.service', '--property=Requires,BindsTo,PartOf')
+                    properties = [line.split('=', 1) for line in dependencies.splitlines()]
+                    if (len(properties) != 3 or any(len(item) != 2 for item in properties)
+                            or {item[0] for item in properties} != {'Requires', 'BindsTo', 'PartOf'}
+                            or any('orbis-host-observer.socket' in item[1].split() for item in properties)):
+                        raise RecoveryRequired('Host still depends on the observer socket')
+                    systemd.run('stop', 'orbis-host-observer.socket')
+                    _observer_socket(systemd, False)
+                if not pending:
+                    systemd.run('restart', 'orbis-sentinel.service')
+                fresh = Systemd()
+                if _profile(fresh, True).get('observerProfile') != original or _observer_host(fresh, original) != host:
+                    raise RecoveryRequired('Observer return must preserve the current running Host')
+                if original is not None:
+                    _observer_socket(fresh, True)
+                else:
+                    _observer_socket(fresh, False)
+                _ready(fresh, installed['version'])
+                _current_retention(root, state, admission['retainedActivation'])
+                _write(state, 'observer-change.json', _encoded({**record, 'phase': 'returned'}), 0o600,
+                       _encoded({**record, 'phase': 'returning'}))
+                return {'ticket': ticket, 'profile': original, 'restored': True}
+            except BaseException:
+                _write(state, 'observer-change.json', _encoded({**record, 'phase': 'recovery-required'}), 0o600,
+                       _encoded({**record, 'phase': 'returning'}))
+                raise
+        finally:
+            os.close(lock)
 
 
 def main():

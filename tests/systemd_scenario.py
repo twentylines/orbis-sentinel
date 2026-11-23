@@ -1,6 +1,7 @@
 """Exercise the real activator inside the disposable Linux systemd rootfs."""
 
 import hashlib
+import fcntl
 from contextlib import contextmanager
 import grp
 import http.client
@@ -76,6 +77,70 @@ def cli(record, workspace):
     return value
 
 
+def signed_lease_roundtrip(old, new):
+    """A real parent lock spans separate verified activation/return children."""
+    original = (activation.STATE / 'installed.json').read_bytes()
+    parent = activation._Parent(activation.STATE)
+    lease = activation._activation_lock(parent, None)
+    try:
+        def child(code, arguments):
+            result = subprocess.run([sys.executable, '-I', '-B', '-c', code,
+                                     str(BASE / 'source/packaging'), str(lease), *arguments],
+                                    pass_fds=(lease,), capture_output=True, timeout=150,
+                                    env={'PATH': os.defpath, 'TMPDIR': str(BASE / 'tmp'),
+                                         'PYTHONDONTWRITEBYTECODE': '1'})
+            assert result.returncode == 0, result.stderr[-2000:]
+            contender = os.open(activation.STATE / 'activation.lock', os.O_RDWR)
+            try:
+                try:
+                    fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    pass
+                else:
+                    raise AssertionError('A child released the coordinator activation lease')
+            finally:
+                os.close(contender)
+            return json.loads(result.stdout)
+        binding = {'operationId': str(uuid.uuid4()), 'planSha256': '6' * 64,
+                   'targetDigest': 'sha256:' + '7' * 64}
+        selected = {key: str(value) for key, value in options(new, 'verify-leased-child').items()}
+        result = child('''import json,pathlib,sys
+sys.path.insert(0,sys.argv[1])
+import activate_release as api
+options=json.loads(sys.argv[3])
+for key in ('artifact','bundle','workspace','verifier'):
+    options[key]=pathlib.Path(options[key])
+print(json.dumps(api.activate_release(**options,retain=json.loads(sys.argv[4]),activation_lock_fd=int(sys.argv[2]))))
+''', [json.dumps(selected), json.dumps(binding)])
+        assert result['publisherVerified'] and result['activated'] and result['previousVersion'] == old['version']
+        activation._ready(activation.Systemd(), new['version'])
+        before = (activation.STATE / 'activation.json').read_bytes()
+        command = [sys.executable, '-I', '-B', str(BASE / 'source/packaging/activate_release.py')]
+        for key, value in options(new, 'verify-competing-under-lease').items():
+            command.extend(['--' + key.replace('_', '-'), str(value)])
+        refused = subprocess.run(command, capture_output=True, timeout=10,
+            env={'PATH': os.defpath, 'TMPDIR': str(BASE / 'tmp'), 'PYTHONDONTWRITEBYTECODE': '1'})
+        assert refused.returncode != 0 and (activation.STATE / 'activation.json').read_bytes() == before
+        assert not (BASE / 'verify-competing-under-lease').exists()
+        program = '''import json,sys
+sys.path.insert(0,sys.argv[1])
+import activate_release as api
+print(json.dumps(api.restore_retained(json.loads(sys.argv[3]),activation_lock_fd=int(sys.argv[2]))))
+'''
+        ticket = result['retainedRollback']
+        returned = child(program, [json.dumps(ticket)])
+        assert returned['restored'] and returned['version'] == old['version']
+        assert (activation.STATE / 'installed.json').read_bytes() == original
+        activation._ready(activation.Systemd(), old['version'])
+        before = activation.Systemd().inspect('orbis-sentinel.service')
+        assert child(program, [json.dumps(ticket)]) == returned
+        after = activation.Systemd().inspect('orbis-sentinel.service')
+        assert all(before[key] == after[key] for key in ('MainPID', 'InvocationID', 'ControlGroup'))
+    finally:
+        os.close(lease)
+        parent.close()
+
+
 def privileges(systemd):
     service = systemd.inspect('orbis-sentinel.service')
     pid = int(service['MainPID'])
@@ -88,7 +153,7 @@ def privileges(systemd):
 
 
 @contextmanager
-def independent_progress():
+def independent_progress(operation='12345678-1234-4123-8123-123456789abc'):
     """A disposable Root progress-only peer, never a lifecycle authority."""
     folder = Path('/run/orbis-upgrade')
     assert not folder.exists() and not folder.is_symlink()
@@ -101,7 +166,7 @@ def independent_progress():
     listener.listen(16)
     listener.settimeout(0.2)
     stop, errors = threading.Event(), []
-    progress = {'version': 1, 'job': {'id': '12345678-1234-4123-8123-123456789abc',
+    progress = {'version': 1, 'job': {'id': operation,
         'state': 'running', 'targetTag': 'v0.9.2', 'phase': 'installing'}}
 
     def serve():
@@ -166,6 +231,72 @@ def await_progress(expected):
             return
         time.sleep(0.1)
     raise AssertionError('Independent progress did not reach the expected live state')
+
+
+def managed_observer_api_roundtrip(record):
+    """Actual managed API/systemd effects with a disposable Host placeholder."""
+    systemd = activation.Systemd()
+    # Prior fault/return cases intentionally exercised this same collector.
+    # Isolate this scenario's start budget, without altering production limits.
+    systemd.run('reset-failed', 'orbis-sentinel.service')
+    host = b'[Unit]\nDescription=Disposable qualification observer placeholder\n[Service]\nType=simple\nExecStart=/usr/bin/sleep infinity\nKillMode=control-group\n'
+    parent = activation._Parent(activation.UNITS)
+    try:
+        assert activation._read(parent, 'orbis-host.service', 0o644) is None
+        activation._write(parent, 'orbis-host.service', host, 0o644)
+    finally:
+        parent.close()
+    systemd.run('daemon-reload')
+    systemd.run('start', 'orbis-host.service')
+    original_host = activation._observer_host(activation.Systemd(), None)
+    binding = {'operationId': str(uuid.uuid4()), 'planSha256': 'c' * 64,
+               'targetDigest': 'sha256:' + 'd' * 64}
+    parent = activation._Parent(activation.STATE)
+    lease = activation._activation_lock(parent, None)
+    try:
+        activated = activation.activate_release(**options(record, 'verify-observer-api-retained'),
+            retain=binding, activation_lock_fd=lease)
+        retained = activated['retainedRollback']
+        before = activation.Systemd().inspect('orbis-sentinel.service')
+        prepared = activation.prepare_observer_profile(retained, activation_lock_fd=lease)
+        assert prepared['prepared'] and prepared['ticket']['binding'] == binding
+        same = activation.Systemd().inspect('orbis-sentinel.service')
+        assert all(same[key] == before[key] for key in ('MainPID', 'InvocationID', 'ControlGroup'))
+        assert activation._observer_host(activation.Systemd(), None, pending=True) == original_host
+        with independent_progress(binding['operationId']) as progress:
+            enrolled = activation.activate_observer_profile(prepared['ticket'], activation_lock_fd=lease)
+            assert enrolled['enrolled'] and enrolled['profile'] == prepared['profile']
+            assert activation._observer_host(activation.Systemd(), enrolled['profile']) == original_host
+            activation._ready(activation.Systemd(), record['version'])
+            await_progress(progress)
+            returned = activation.restore_observer_profile(prepared['ticket'], activation_lock_fd=lease)
+            assert returned['restored'] and returned['profile'] is None
+            assert activation._observer_host(activation.Systemd(), None) == original_host
+            activation._ready(activation.Systemd(), record['version'])
+        # A known prepared change can return if the progress endpoint cannot
+        # start. Neither Host nor collector may restart in that path.
+        next_binding = {**binding, 'operationId': str(uuid.uuid4()), 'planSha256': 'e' * 64}
+        next_activation = activation.activate_release(**options(record, 'verify-observer-api-prepared-only'),
+            retain=next_binding, activation_lock_fd=lease)
+        before = activation.Systemd().inspect('orbis-sentinel.service')
+        prepared = activation.prepare_observer_profile(next_activation['retainedRollback'], activation_lock_fd=lease)
+        assert activation.restore_observer_profile(prepared['ticket'], activation_lock_fd=lease)['restored']
+        same = activation.Systemd().inspect('orbis-sentinel.service')
+        assert all(same[key] == before[key] for key in ('MainPID', 'InvocationID', 'ControlGroup'))
+        assert activation._observer_host(activation.Systemd(), None) == original_host
+        other = os.open(activation.STATE / 'activation.lock', os.O_RDWR | os.O_NOFOLLOW)
+        try:
+            try:
+                fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                pass
+            else:
+                raise AssertionError('A managed observer API released the parent activation lease')
+        finally:
+            os.close(other)
+    finally:
+        os.close(lease)
+        parent.close()
 
 
 def managed_observer_profile(systemd, current_directory, record, name='orbis-observer-v1', *, progress=None):
@@ -378,6 +509,7 @@ def main():
     assert activation.restore_retained(retention) == returned
     observed = systemd.inspect('orbis-sentinel.service')
     assert all(observed[key] == same[key] for key in ('MainPID', 'InvocationID', 'ControlGroup'))
+    signed_lease_roundtrip(old, new)
     systemd.run('reset-failed', 'orbis-sentinel.service')
     assert cli(new, 'verify-after-retained-return')['previousVersion'] == old['version']
     activation._ready(activation.Systemd(), new['version'])
@@ -391,6 +523,7 @@ def main():
     observed = systemd.inspect('orbis-sentinel.service')
     assert all(observed[key] == same[key] for key in ('MainPID', 'InvocationID', 'ControlGroup'))
     assert snapshot(old_directory) == old_files and snapshot(current_directory) == current_files
+    managed_observer_api_roundtrip(new)
     systemd = managed_observer_profile(systemd, current_directory, new)
     with independent_progress() as progress:
         systemd = managed_observer_profile(systemd, current_directory, new, 'orbis-observer-v2', progress=progress)
@@ -402,6 +535,11 @@ def main():
                   'older-orbis-installer-cli-refusal', 'managed-observer-profile-loaded',
                   'exact-retained-signed-collector-return', 'retained-return-observed-replay',
                   'signed-update-after-retained-return', 'superseded-retained-return-refusal',
+                  'signed-child-activation-under-parent-lease', 'competing-cli-refused-under-parent-lease',
+                  'signed-child-return-under-parent-lease', 'leased-return-observed-replay',
+                  'managed-observer-api-prepare-without-restart', 'managed-observer-api-progress-ready-before-restart',
+                  'managed-observer-api-activation-preserves-host', 'managed-observer-api-return-preserves-host',
+                  'managed-observer-api-prepared-only-return-without-restart', 'managed-observer-api-preserves-parent-lease',
                   'signed-collector-retry-preserves-managed-observer', 'unreviewed-managed-observer-change-refused',
                   'managed-independent-progress-profile-loaded', 'signed-collector-retry-preserves-independent-progress',
                   'independent-progress-with-stalled-host', 'unreviewed-independent-profile-change-refused',
