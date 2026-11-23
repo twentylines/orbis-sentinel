@@ -177,14 +177,19 @@ def main(argv=None):
     parser.add_argument("--host-copy-sha256", metavar="SHA256", help="exact installed-copy receipt for Host source review")
     parser.add_argument("--disk-path", action="append", dest="paths", help="filesystem to monitor (repeatable)")
     parser.add_argument("--observer-socket", help="enrolled read-only host progress socket")
+    parser.add_argument('--upgrade-observer-socket', help='enrolled independent read-only update progress socket')
     args = parser.parse_args(arguments)
+    if (args.upgrade_observer_socket is not None
+            and ((args.socket is None and not args.systemd_socket) or not args.observer_socket)):
+        parser.error('The independent upgrade observer requires the status service and Host observer.')
     bootstrap_args = (args.bootstrap_operation, args.review_sha256, args.plan_sha256, args.request_id, args.save_key_to,
                       args.activation_packet_sha256, args.activation_approval_sha256)
     worker_inputs = (args.publisher_receipt_sha256, args.worker_review_sha256, args.worker_approval_sha256)
     listener_inputs = (args.listener_worker_receipt_sha256, args.listener_loopback_port,
                        args.listener_review_sha256, args.listener_approval_sha256)
     listener_origin = (args.listener_origin_operation,args.listener_origin_receipt_sha256)
-    unrelated = (*bootstrap_args, args.paths, args.observer_socket, args.installer_selection, args.host_copy_sha256)
+    unrelated = (*bootstrap_args, args.paths, args.observer_socket, args.upgrade_observer_socket,
+                 args.installer_selection, args.host_copy_sha256)
     https_inputs = (args.https_review_sha256, args.https_approval_sha256)
     https_operation = args.review_recovery_https or args.apply_recovery_https or args.export_recovery_https_ca
     if args.recovery_https_edge or https_operation is not None:
@@ -299,7 +304,8 @@ def main(argv=None):
     try:
         collector = TelemetryCollector(tuple(args.paths) if args.paths else ("/",))
         if args.observer_socket:
-            observer = ObserverCollector(args.observer_socket)
+            options = {'upgrade_socket': args.upgrade_observer_socket} if args.upgrade_observer_socket is not None else {}
+            observer = ObserverCollector(args.observer_socket, **options)
         if args.systemd_socket:
             listener = activation_listener()
         providers = {

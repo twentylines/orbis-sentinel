@@ -70,6 +70,20 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(Path(first["artifact"]).read_bytes(), Path(second["artifact"]).read_bytes())
         self.assertEqual(first["sha256"], second["sha256"])
 
+    def test_independent_observer_command_requires_its_entire_packaged_contract(self):
+        runtime = self.source/'src/orbis_sentinel/runtime.py'
+        runtime.write_text("OPTION = '--upgrade-observer-socket'\n")
+        with self.assertRaisesRegex(ValueError, 'independent upgrade observer contract'):
+            release.build_release(self.source, self.root/'incomplete')
+        for name in release.UPGRADE_OBSERVER_MEMBERS:
+            path = self.source/name
+            if not path.exists():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text('# fixture member\n')
+        result = release.build_release(self.source, self.root/'complete')
+        with tarfile.open(result['artifact']) as archive:
+            self.assertTrue(release.UPGRADE_OBSERVER_MEMBERS <= set(archive.getnames()))
+
     def test_extraction_preserves_public_directory_access_under_private_umask(self):
         result = release.build_release(self.source, self.root / "out")
         destination = self.root / "installed"

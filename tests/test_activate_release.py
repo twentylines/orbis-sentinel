@@ -148,13 +148,15 @@ class ActivationTests(unittest.TestCase):
     def journal(self):
         return json.loads((self.state / 'activation.json').read_bytes())
 
-    def managed_observer(self):
+    def managed_observer(self, name='orbis-observer-v1'):
         paths = {
             'collector': (self.units / 'orbis-sentinel.service.d/observer.conf', PACKAGING / 'systemd/orbis-sentinel.service.d/observer.conf'),
             'host': (self.units / 'orbis-host.service.d/sentinel-observer.conf', PACKAGING / 'systemd/orbis-host.service.d/sentinel-observer.conf'),
             'socket': (self.units / 'orbis-host-observer.socket', PACKAGING / 'systemd/orbis-host-observer.socket'),
             'sysusers': (activate.SYSUSERS / 'orbis-sentinel-observer.conf', PACKAGING / 'sysusers.d/orbis-sentinel-observer.conf'),
         }
+        if name == 'orbis-observer-v2':
+            paths['collector'] = (paths['collector'][0], PACKAGING / 'systemd/observer-profiles/upgrade-observer.conf')
         for target, source in paths.values():
             target.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
             target.write_bytes(source.read_bytes())
@@ -171,8 +173,8 @@ class ActivationTests(unittest.TestCase):
             'orbis-host-observer.socket': {'LoadState': 'loaded', 'FragmentPath': str(paths['socket'][0]),
                 'DropInPaths': '', 'NeedDaemonReload': 'no'},
         }
-        receipt = {'schema': 'orbis-sentinel.observer-profile.v1', 'profile': 'orbis-observer-v1',
-                   'groupId': 1234, 'files': dict(activate.OBSERVER_HASHES)}
+        receipt = {'schema': 'orbis-sentinel.observer-profile.v1', 'profile': name,
+                   'groupId': 1234, 'files': dict(activate.OBSERVER_PROFILES[name])}
         (self.state / 'observer-profile.json').write_bytes(activate._encoded(receipt))
         (self.state / 'observer-profile.json').chmod(0o600)
         return receipt
@@ -262,6 +264,36 @@ class ActivationTests(unittest.TestCase):
         self.assertEqual(before, {role: file.read_bytes() for role, file in self.observer_paths.items()})
         self.assertEqual((self.state / 'observer-profile.json').read_bytes(), activate._encoded(receipt))
 
+    def test_recorded_independent_upgrade_observer_survives_a_collector_update(self):
+        self.run_activation()
+        receipt = self.managed_observer('orbis-observer-v2')
+        before = {role: file.read_bytes() for role, file in self.observer_paths.items()}
+        result = self.run_activation(self.build('0.1.0-dev.11'))
+        self.assertTrue(result['activated'])
+        self.assertEqual(self.journal()['previousUnits']['observerProfile'], receipt)
+        self.assertEqual(before, {role: file.read_bytes() for role, file in self.observer_paths.items()})
+
+    def test_profile_name_does_not_authorize_the_other_collector_template(self):
+        self.run_activation()
+        receipt = self.managed_observer('orbis-observer-v2')
+        self.observer_paths['collector'].write_bytes((PACKAGING / 'systemd/orbis-sentinel.service.d/observer.conf').read_bytes())
+        self.systemd.events.clear()
+        with self.assertRaisesRegex(activate.ActivationError, 'observer files changed'):
+            self.run_activation(self.build('0.1.0-dev.11'))
+        self.assertEqual(self.systemd.events, [])
+        self.assertEqual((self.state / 'observer-profile.json').read_bytes(), activate._encoded(receipt))
+
+    def test_unknown_profile_and_unrecorded_profile_transition_are_refused(self):
+        self.run_activation()
+        receipt = self.managed_observer('orbis-observer-v2')
+        for name in ('orbis-observer-v3', 'orbis-observer-v1'):
+            changed = {**receipt, 'profile': name}
+            (self.state / 'observer-profile.json').write_bytes(activate._encoded(changed))
+            self.systemd.events.clear()
+            with self.subTest(profile=name), self.assertRaises(activate.ActivationError):
+                self.run_activation(self.build('0.1.0-dev.11'))
+            self.assertEqual(self.systemd.events, [])
+
     def test_known_observer_bytes_without_a_managed_receipt_are_not_adopted(self):
         self.run_activation()
         self.managed_observer()
@@ -318,6 +350,18 @@ class ActivationTests(unittest.TestCase):
         self.assertEqual(self.journal()['phase'], 'recovery-required')
         self.assertTrue((self.install / 'releases/0.1.0-dev.10').is_dir())
         self.assertTrue((self.install / 'releases/0.1.0-dev.11').is_dir())
+
+    def test_even_a_known_profile_transition_during_activation_requires_reconciliation(self):
+        self.run_activation()
+        self.managed_observer()
+        ready = self.ready
+        def changed(systemd, version):
+            ready(systemd, version)
+            self.managed_observer('orbis-observer-v2')
+        with mock.patch.object(activate, '_ready', side_effect=changed):
+            with self.assertRaises(activate.RecoveryRequired):
+                self.run_activation(self.build('0.1.0-dev.11'))
+        self.assertEqual(self.journal()['phase'], 'recovery-required')
 
     def test_first_install_uses_real_staging_and_writes_a_private_verified_receipt(self):
         self.systemd.socket_state = 'running'

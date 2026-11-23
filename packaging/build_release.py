@@ -28,6 +28,15 @@ RECOVERY_HTTPS_MEMBERS = {
 }
 
 RECOVERY_BACKEND_COMMAND = "--prepare-recovery-listener-backend"
+UPGRADE_OBSERVER_COMMAND = '--upgrade-observer-socket'
+UPGRADE_OBSERVER_MEMBERS = {
+    'src/orbis_sentinel/observer.py',
+    'packaging/systemd/observer-profiles/upgrade-observer.conf',
+    'packaging/systemd/orbis-sentinel.service.d/observer.conf',
+    'packaging/systemd/orbis-host.service.d/sentinel-observer.conf',
+    'packaging/systemd/orbis-host-observer.socket',
+    'packaging/sysusers.d/orbis-sentinel-observer.conf',
+}
 RECOVERY_BACKEND_ENTRY = "src/orbis_sentinel/recovery_backend_tls.py"
 RECOVERY_BACKEND_MEMBERS = RECOVERY_HTTPS_MEMBERS | {
     RECOVERY_BACKEND_ENTRY,
@@ -132,6 +141,9 @@ def build_release(source: Path, output: Path) -> dict[str, object]:
                 if (any(isinstance(node,ast.Constant) and node.value == RECOVERY_BACKEND_COMMAND for node in ast.walk(tree))
                         and any(source/name not in paths for name in RECOVERY_BACKEND_MEMBERS)):
                     raise ValueError("Release runtime requires the private recovery contract")
+                if (any(isinstance(node,ast.Constant) and node.value == UPGRADE_OBSERVER_COMMAND for node in ast.walk(tree))
+                        and any(source/name not in paths for name in UPGRADE_OBSERVER_MEMBERS)):
+                    raise ValueError('Release runtime requires the independent upgrade observer contract')
         payload[relative] = data
         identities[path] = identity
     version = component_version(payload["src/orbis_sentinel/__init__.py"])

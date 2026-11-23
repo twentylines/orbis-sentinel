@@ -346,20 +346,68 @@ class _HandoffCollector(TelemetryCollector):
         super().__init__((socket_path,), 2.0, max_age=HANDOFF_MAX_AGE_MS / 1000, worker=_handoff_worker)
 
 
+def _upgrade_worker(output, paths, interval):
+    """Read only progress from the independent Root update supervisor."""
+    client = ObserverClient(paths[0])
+    output.setblocking(False)
+    try:
+        while True:
+            started = time.monotonic()
+            sample = {'schema': 'orbis-sentinel.progress-sample.v1', 'available': False, 'progress': None}
+            try:
+                sample.update(available=True, progress=client.read(deadline=started + 2))
+            except (OSError, ValueError, TypeError, OverflowError, RecursionError):
+                pass
+            try:
+                output.send(json.dumps({'observed': started, 'sample': sample}, allow_nan=False,
+                                       separators=(',', ':')).encode())
+            except (OSError, ValueError):
+                pass
+            time.sleep(max(0, interval - (time.monotonic() - started)))
+    finally:
+        output.close()
+
+
+class _UpgradeCollector(TelemetryCollector):
+    schema = 'orbis-sentinel.progress-sample.v1'
+
+    def __init__(self, socket_path):
+        super().__init__((socket_path,), 1.0, max_age=5.0, worker=_upgrade_worker)
+
+
+def _progress_snapshot(value):
+    sample = value['sample']
+    available = value['state'] == 'ready' and type(sample) is dict and sample.get('available') is True
+    progress = None
+    if available:
+        try:
+            progress = validate_progress(sample.get('progress'))
+        except (ValueError, TypeError):
+            available = False
+    return {'schema': 'orbis-sentinel.progress.v1', 'available': available,
+            'progress': progress if available else None, 'ageMs': value['ageMs'], 'sourceState': value['state']}
+
+
 class ObserverCollector(TelemetryCollector):
     schema = "orbis-sentinel.progress-sample.v1"
 
-    def __init__(self, socket_path):
+    def __init__(self, socket_path, *, upgrade_socket=None):
         checked = ObserverClient(socket_path)
+        upgrade = ObserverClient(upgrade_socket) if upgrade_socket is not None else None
+        if upgrade is not None and os.path.normpath(upgrade.path) == os.path.normpath(checked.path):
+            raise ValueError('The independent upgrade observer must use a separate socket')
         super().__init__((checked.path,), 1.0, max_age=5.0, worker=_observer_worker)
         self.components = _ComponentCollector(checked.path)
         self.handoffs = _HandoffCollector(checked.path)
+        self.upgrade = _UpgradeCollector(upgrade.path) if upgrade is not None else None
 
     def start(self):
         try:
             super().start()
             self.components.start()
             self.handoffs.start()
+            if self.upgrade is not None:
+                self.upgrade.start()
         except BaseException:
             self.close()
             raise
@@ -368,22 +416,44 @@ class ObserverCollector(TelemetryCollector):
         super().maintain()
         self.components.maintain()
         self.handoffs.maintain()
+        if self.upgrade is not None:
+            self.upgrade.maintain()
 
     def close(self):
         try:
-            self.handoffs.close()
+            if self.upgrade is not None:
+                self.upgrade.close()
         finally:
             try:
-                self.components.close()
+                self.handoffs.close()
             finally:
-                super().close()
+                try:
+                    self.components.close()
+                finally:
+                    super().close()
 
     def snapshot(self):
-        value = super().snapshot()
-        sample = value["sample"]
-        available = value["state"] == "ready" and type(sample) is dict and sample.get("available") is True
-        return {"schema": "orbis-sentinel.progress.v1", "available": available,
-                "progress": sample["progress"] if available else None, "ageMs": value["ageMs"], "sourceState": value["state"]}
+        host = _progress_snapshot(super().snapshot())
+        if self.upgrade is None:
+            return host
+        upgrade = _progress_snapshot(self.upgrade.snapshot())
+        selected = upgrade['progress']['job'] if upgrade['available'] else None
+        previous = host['progress']['job'] if host['available'] else None
+        if selected is None:
+            return host
+        if previous is not None:
+            active = {'queued', 'running', 'recovering', 'interrupted'}
+            if selected['id'] == previous['id']:
+                if selected['targetTag'] != previous['targetTag']:
+                    return {'schema': 'orbis-sentinel.progress.v1', 'available': False,
+                            'progress': None, 'ageMs': None, 'sourceState': 'unavailable'}
+            elif previous['state'] in active:
+                if selected['state'] not in active:
+                    return host
+                # Two different active identities are not one verified update.
+                return {'schema': 'orbis-sentinel.progress.v1', 'available': False,
+                        'progress': None, 'ageMs': None, 'sourceState': 'unavailable'}
+        return upgrade
 
     def component_snapshot(self):
         # Component observation has its own owned worker and freshness budget.

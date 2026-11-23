@@ -45,6 +45,11 @@ OBSERVER_HASHES = {
     'socket': '5a04369125cadf908e516715b790923a420572d963830f05f6fd7388cfc19f92',
     'sysusers': '9b29a027c32eb3e93b33521b6b0b8de687c33512fd6e9cf711c42cb2366a1792',
 }
+OBSERVER_PROFILES = {
+    'orbis-observer-v1': OBSERVER_HASHES,
+    'orbis-observer-v2': {**OBSERVER_HASHES,
+        'collector': 'cf886ca0a13c120a587b3aae96b8595210c48b7f3eef036b3853d9e2e333c0b8'},
+}
 _OBSERVER_UNSET = object()
 UNIT_HASHES = {
     'orbis-sentinel.service': '513adea38d6b5f640bf2d827bebec6ec665cbef39d7a7e01e25742fdfce97b06',
@@ -307,6 +312,14 @@ def _observer_profile(systemd, installed, drop_ins):
             raise ActivationError('Sentinel has an unreviewed observer drop-in')
     if not installed or drop_ins != str(collector) or receipt is None:
         raise ActivationError('Sentinel observer adoption requires an independently recorded managed profile')
+    try:
+        selected = _json(receipt)
+        name = selected.get('profile') if type(selected) is dict else None
+        hashes = OBSERVER_PROFILES.get(name) if type(name) is str else None
+    except (ValueError, TypeError):
+        hashes = None
+    if hashes is None:
+        raise ActivationError('The managed observer profile is unsupported')
     paths = {
         'collector': collector,
         'host': UNITS / 'orbis-host.service.d' / 'sentinel-observer.conf',
@@ -318,7 +331,7 @@ def _observer_profile(systemd, installed, drop_ins):
             if role == 'host' and set(os.listdir(parent.fd)) != {path.name}:
                 raise ActivationError('The Host observer has unreviewed drop-ins')
             body = _read(parent, path.name, 0o644, 4096)
-            if body is None or hashlib.sha256(body).hexdigest() != OBSERVER_HASHES[role]:
+            if body is None or hashlib.sha256(body).hexdigest() != hashes[role]:
                 raise ActivationError('The managed observer files changed')
     try:
         group = grp.getgrnam('orbis-observer').gr_gid
@@ -326,8 +339,8 @@ def _observer_profile(systemd, installed, drop_ins):
         raise ActivationError('The managed observer group is unavailable') from error
     if type(group) is not int or not 0 < group < 2**31:
         raise ActivationError('The managed observer group is unavailable')
-    profile = {'schema': 'orbis-sentinel.observer-profile.v1', 'profile': 'orbis-observer-v1',
-               'groupId': group, 'files': dict(OBSERVER_HASHES)}
+    profile = {'schema': 'orbis-sentinel.observer-profile.v1', 'profile': name,
+               'groupId': group, 'files': dict(hashes)}
     if receipt != _encoded(profile):
         raise ActivationError('The managed observer receipt differs from the installed profile')
     for name, fragment, expected_drop_ins in (

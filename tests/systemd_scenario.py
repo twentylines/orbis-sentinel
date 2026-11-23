@@ -1,6 +1,7 @@
 """Exercise the real activator inside the disposable Linux systemd rootfs."""
 
 import hashlib
+from contextlib import contextmanager
 import grp
 import http.client
 import io
@@ -10,6 +11,8 @@ from pathlib import Path
 import socket
 import subprocess
 import sys
+import threading
+import time
 from types import SimpleNamespace
 
 
@@ -83,7 +86,88 @@ def privileges(systemd):
     assert os.stat(activation.SOCKET).st_mode & 0o777 == 0o600
 
 
-def managed_observer_profile(systemd, current_directory, record):
+@contextmanager
+def independent_progress():
+    """A disposable Root progress-only peer, never a lifecycle authority."""
+    folder = Path('/run/orbis-upgrade')
+    assert not folder.exists() and not folder.is_symlink()
+    folder.mkdir(mode=0o755)
+    endpoint = folder / 'progress.sock'
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(endpoint))
+    os.chown(endpoint, 0, grp.getgrnam('orbis-observer').gr_gid)
+    endpoint.chmod(0o660)
+    listener.listen(16)
+    listener.settimeout(0.2)
+    stop, errors = threading.Event(), []
+    progress = {'version': 1, 'job': {'id': '12345678-1234-4123-8123-123456789abc',
+        'state': 'running', 'targetTag': 'v0.9.2', 'phase': 'installing'}}
+
+    def serve():
+        while not stop.is_set():
+            try:
+                conn, _ = listener.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                if stop.is_set():
+                    return
+                raise
+            try:
+                with conn:
+                    conn.settimeout(2)
+                    header = b''
+                    while b'\r\n\r\n' not in header:
+                        chunk = conn.recv(4096)
+                        if not chunk:
+                            break
+                        assert len(header) + len(chunk) <= 4096
+                        header += chunk
+                    if b'\r\n\r\n' not in header:
+                        continue
+                    route = header.split(b'\r\n', 1)[0]
+                    if route == b'GET /v1/capability HTTP/1.1':
+                        payload = {'schema': 'orbis.sentinel-observer.v1', 'protocolVersion': 1,
+                                   'kind': 'core-update-progress'}
+                    elif route == b'GET /v1/core-operation/progress HTTP/1.1':
+                        payload = progress
+                    else:
+                        raise AssertionError('Independent observer requested an unrelated route')
+                    body = json.dumps(payload).encode()
+                    conn.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: ' + str(len(body)).encode()
+                                 + b'\r\nConnection: close\r\n\r\n' + body)
+            except OSError:
+                # A collector restart can retire its reader mid-exchange.
+                pass
+            except BaseException as error:
+                errors.append(error)
+                stop.set()
+
+    thread = threading.Thread(target=serve, name='qualification-upgrade-observer')
+    thread.start()
+    try:
+        yield progress
+    finally:
+        stop.set()
+        listener.close()
+        thread.join(3)
+        assert not thread.is_alive() and not errors
+        endpoint.unlink()
+        folder.rmdir()
+
+
+def await_progress(expected):
+    deadline = time.monotonic() + 12
+    while time.monotonic() < deadline:
+        value = request('progress')
+        if ((expected is None and value['available'] is False and value['progress'] is None)
+                or expected is not None and value['available'] is True and value['progress'] == expected):
+            return
+        time.sleep(0.1)
+    raise AssertionError('Independent progress did not reach the expected live state')
+
+
+def managed_observer_profile(systemd, current_directory, record, name='orbis-observer-v1', *, progress=None):
     # Earlier scenarios intentionally fail and roll back the same service.
     # Give this independent fixture its own restart budget; production start
     # limits and the activator's health/rollback behavior remain unchanged.
@@ -97,15 +181,22 @@ def managed_observer_profile(systemd, current_directory, record):
         'socket': (activation.UNITS / 'orbis-host-observer.socket', 'packaging/systemd/orbis-host-observer.socket'),
         'sysusers': (activation.SYSUSERS / 'orbis-sentinel-observer.conf', 'packaging/sysusers.d/orbis-sentinel-observer.conf'),
     }
+    hashes = activation.OBSERVER_PROFILES[name]
+    suffix = name.rsplit('-', 1)[1]
+    if name == 'orbis-observer-v2':
+        paths['collector'] = (paths['collector'][0], 'packaging/systemd/observer-profiles/upgrade-observer.conf')
     for role, (target, source) in paths.items():
         body = (current_directory / source).read_bytes()
-        assert hashlib.sha256(body).hexdigest() == activation.OBSERVER_HASHES[role]
+        assert hashlib.sha256(body).hexdigest() == hashes[role]
         target.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
     # Use the activator's protected writer and exact expected bodies.
-    for target, source in paths.values():
+    for role, (target, source) in paths.items():
         parent = activation._Parent(target.parent)
         try:
-            activation._write(parent, target.name, (current_directory / source).read_bytes(), 0o644)
+            previous = activation._read(parent, target.name, 0o644, 4096)
+            assert previous is None or hashlib.sha256(previous).hexdigest() in {
+                profile[role] for profile in activation.OBSERVER_PROFILES.values()}
+            activation._write(parent, target.name, (current_directory / source).read_bytes(), 0o644, previous)
         finally:
             parent.close()
     subprocess.run(['/usr/bin/systemd-sysusers', str(paths['sysusers'][0])], check=True,
@@ -115,14 +206,20 @@ def managed_observer_profile(systemd, current_directory, record):
     host = b'[Unit]\nDescription=Disposable qualification observer placeholder\n[Service]\nType=simple\nExecStart=/usr/bin/sleep infinity\nKillMode=control-group\n'
     parent = activation._Parent(activation.UNITS)
     try:
-        activation._write(parent, 'orbis-host.service', host, 0o644)
+        previous = activation._read(parent, 'orbis-host.service', 0o644, 4096)
+        assert previous in (None, host)
+        activation._write(parent, 'orbis-host.service', host, 0o644, previous)
     finally:
         parent.close()
-    profile = {'schema': 'orbis-sentinel.observer-profile.v1', 'profile': 'orbis-observer-v1',
-               'groupId': group, 'files': dict(activation.OBSERVER_HASHES)}
+    profile = {'schema': 'orbis-sentinel.observer-profile.v1', 'profile': name,
+               'groupId': group, 'files': dict(hashes)}
     parent = activation._Parent(activation.STATE)
     try:
-        activation._write(parent, 'observer-profile.json', activation._encoded(profile), 0o600)
+        previous = activation._read(parent, 'observer-profile.json', 0o600, 8192)
+        assert previous is None or any(previous == activation._encoded({
+            'schema': 'orbis-sentinel.observer-profile.v1', 'profile': selected,
+            'groupId': group, 'files': dict(values)}) for selected, values in activation.OBSERVER_PROFILES.items())
+        activation._write(parent, 'observer-profile.json', activation._encoded(profile), 0o600, previous)
     finally:
         parent.close()
     systemd.run('daemon-reload')
@@ -136,21 +233,28 @@ def managed_observer_profile(systemd, current_directory, record):
     fields = dict(line.split(':', 1) for line in Path(f'/proc/{pid}/status').read_text().splitlines() if ':' in line)
     assert int(fields['Gid'].split()[1]) == group
     assert b'--observer-socket\0/run/orbis-observer/progress.sock\0' in Path(f'/proc/{pid}/cmdline').read_bytes()
+    command = Path(f'/proc/{pid}/cmdline').read_bytes()
+    assert (b'--upgrade-observer-socket\0/run/orbis-upgrade/progress.sock\0' in command) == (name == 'orbis-observer-v2')
+    if progress is not None:
+        await_progress(progress)
     privileges(systemd)
     before = {role: target.read_bytes() for role, (target, _) in paths.items()}
-    result = cli(record, 'verify-managed-observer')
+    result = cli(record, 'verify-managed-observer-' + suffix)
     assert result['activated'] is True and result['reused'] is True
     systemd = activation.Systemd()
     activation._ready(systemd, record['version'])
     assert before == {role: target.read_bytes() for role, (target, _) in paths.items()}
     journal = json.loads((activation.STATE / 'activation.json').read_bytes())
     assert journal['phase'] == 'complete' and journal['previousUnits']['observerProfile'] == profile
+    if progress is not None:
+        await_progress(progress)
+        assert request('status')['components']['orbis']['state'] == 'unknown'
     collector = paths['collector'][0]
     modified = before['collector'] + b'\n# not the recorded managed template\n'
     collector.write_bytes(modified)
     prior = systemd.inspect('orbis-sentinel.service')
     try:
-        activation.activate_release(**options(record, 'verify-observer-drift'))
+        activation.activate_release(**options(record, 'verify-observer-drift-' + suffix))
     except activation.ActivationError:
         pass
     else:
@@ -258,17 +362,24 @@ def main():
     privileges(systemd)
     assert snapshot(old_directory) == old_files
     systemd = managed_observer_profile(systemd, current_directory, new)
+    with independent_progress() as progress:
+        systemd = managed_observer_profile(systemd, current_directory, new, 'orbis-observer-v2', progress=progress)
+    await_progress(None)
     systemd.stop()
     print(json.dumps({'schema': 'orbis-sentinel.systemd-qualification.v1', 'passed': True,
         'cases': ['signed-first-install', 'fault-injected-health-rollback', 'signed-older-to-current-retry',
                   'retained-old-runtime', 'independent-unprivileged-service', 'older-installer-downgrade-refusal',
                   'older-orbis-installer-cli-refusal', 'managed-observer-profile-loaded',
                   'signed-collector-retry-preserves-managed-observer', 'unreviewed-managed-observer-change-refused',
+                  'managed-independent-progress-profile-loaded', 'signed-collector-retry-preserves-independent-progress',
+                  'independent-progress-with-stalled-host', 'unreviewed-independent-profile-change-refused',
+                  'independent-progress-clears-after-supervisor-stop',
                   'supervisor-stop'],
         'oldVersion': old['version'], 'newVersion': new['version'],
         'orbisAdapterSource': '9e8f9f5bce1a7e8a3a7ee1d0070dbcd20228684f',
         'publisherVerification': 'real', 'systemd': 'real', 'healthFaultOnly': 'explicit injection',
-        'observerHost': 'disposable-placeholder', 'installedRecoveryAccepted': 0,
+        'observerHost': 'disposable-placeholder', 'upgradeObserver': 'disposable-supervisor-placeholder',
+        'installedRecoveryAccepted': 0,
         'retainedOldFiles': len(old_files)}, sort_keys=True))
 
 
