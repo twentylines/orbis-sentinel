@@ -6,9 +6,12 @@ changes Orbis enrollment, or removes a retained component version.
 
 from __future__ import annotations
 
+from contextlib import closing
+
 import argparse
 import fcntl
 import hashlib
+import grp
 import http.client
 import io
 import json
@@ -35,6 +38,14 @@ STATE = Path('/var/lib/orbis-sentinel')
 UNITS = Path('/etc/systemd/system')
 SOCKET = Path('/run/orbis-sentinel/api.sock')
 SYSTEMCTL = Path('/usr/bin/systemctl')
+SYSUSERS = Path('/etc/sysusers.d')
+OBSERVER_HASHES = {
+    'collector': '0488d814326acad265265c8fcf538fa3afe565ae7e49fc958e726306a58144fa',
+    'host': 'fb08ef308356878e33e73cee5dd61d439c7b81bd59648a5318305a38724b5d9d',
+    'socket': '5a04369125cadf908e516715b790923a420572d963830f05f6fd7388cfc19f92',
+    'sysusers': '9b29a027c32eb3e93b33521b6b0b8de687c33512fd6e9cf711c42cb2366a1792',
+}
+_OBSERVER_UNSET = object()
 UNIT_HASHES = {
     'orbis-sentinel.service': '513adea38d6b5f640bf2d827bebec6ec665cbef39d7a7e01e25742fdfce97b06',
     'orbis-sentinel.socket': '6a77a07d0b8ef62507352565d12626e96ab63dceb6131749b893f5093c09054b',
@@ -280,8 +291,59 @@ class Systemd:
                 raise RecoveryRequired('Systemd could not establish Sentinel quiescence')
 
 
+def _observer_profile(systemd, installed, drop_ins):
+    collector = UNITS / 'orbis-sentinel.service.d' / 'observer.conf'
+    with closing(_Parent(STATE)) as state:
+        receipt = _read(state, 'observer-profile.json', 0o600, 8192)
+    if not collector.parent.exists() and not collector.parent.is_symlink():
+        if drop_ins or receipt is not None:
+            raise ActivationError('The managed Sentinel observer profile requires review')
+        return None
+    with closing(_Parent(collector.parent)) as parent:
+        entries = set(os.listdir(parent.fd))
+        if not entries and not drop_ins and receipt is None:
+            return None
+        if entries != {collector.name}:
+            raise ActivationError('Sentinel has an unreviewed observer drop-in')
+    if not installed or drop_ins != str(collector) or receipt is None:
+        raise ActivationError('Sentinel observer adoption requires an independently recorded managed profile')
+    paths = {
+        'collector': collector,
+        'host': UNITS / 'orbis-host.service.d' / 'sentinel-observer.conf',
+        'socket': UNITS / 'orbis-host-observer.socket',
+        'sysusers': SYSUSERS / 'orbis-sentinel-observer.conf',
+    }
+    for role, path in paths.items():
+        with closing(_Parent(path.parent)) as parent:
+            if role == 'host' and set(os.listdir(parent.fd)) != {path.name}:
+                raise ActivationError('The Host observer has unreviewed drop-ins')
+            body = _read(parent, path.name, 0o644, 4096)
+            if body is None or hashlib.sha256(body).hexdigest() != OBSERVER_HASHES[role]:
+                raise ActivationError('The managed observer files changed')
+    try:
+        group = grp.getgrnam('orbis-observer').gr_gid
+    except KeyError as error:
+        raise ActivationError('The managed observer group is unavailable') from error
+    if type(group) is not int or not 0 < group < 2**31:
+        raise ActivationError('The managed observer group is unavailable')
+    profile = {'schema': 'orbis-sentinel.observer-profile.v1', 'profile': 'orbis-observer-v1',
+               'groupId': group, 'files': dict(OBSERVER_HASHES)}
+    if receipt != _encoded(profile):
+        raise ActivationError('The managed observer receipt differs from the installed profile')
+    for name, fragment, expected_drop_ins in (
+            ('orbis-host.service', UNITS / 'orbis-host.service', str(paths['host'])),
+            ('orbis-host-observer.socket', paths['socket'], '')):
+        loaded = systemd.inspect(name)
+        if (loaded['LoadState'] != 'loaded' or loaded['FragmentPath'] != str(fragment)
+                or loaded['DropInPaths'] != expected_drop_ins or loaded['NeedDaemonReload'] != 'no'
+                or (name.endswith('.service') and loaded['KillMode'] != 'control-group')):
+            raise ActivationError('The loaded Host observer profile requires review')
+    return profile
+
+
 def _profile(systemd, installed, *, allow_transition=False):
     observed = {}
+    collector_drop_ins = None
     for name in UNIT_HASHES:
         value = systemd.inspect(name)
         if not installed:
@@ -290,16 +352,26 @@ def _profile(systemd, installed, *, allow_transition=False):
                     or value.get('MainPID', '0') != '0' or value['ControlPID'] != '0' or value['ControlGroup']):
                 raise ActivationError('An unmanaged Sentinel systemd unit already exists')
         elif (value['LoadState'] != 'loaded' or value['FragmentPath'] != str(UNITS / name)
-                or value['DropInPaths'] or value['NeedDaemonReload'] != 'no'
+                or value['DropInPaths'] not in ({'', str(UNITS / 'orbis-sentinel.service.d' / 'observer.conf')} if name.endswith('.service') else {''})
+                or value['NeedDaemonReload'] != 'no'
                 or value['UnitFileState'] not in {'enabled', 'disabled'}
                 or value['ActiveState'] not in ({'active', 'inactive', 'failed', 'activating', 'deactivating', 'reloading'}
                                               if allow_transition else {'active', 'inactive', 'failed'})
                 or (name.endswith('.service') and value['KillMode'] != 'control-group')):
             raise ActivationError('The loaded Sentinel profile requires independent review')
         observed[name] = {'active': value['ActiveState'] == 'active', 'enabled': value['UnitFileState'] == 'enabled'}
+        if name == 'orbis-sentinel.service':
+            collector_drop_ins = value['DropInPaths']
     if (installed and not allow_transition and observed['orbis-sentinel.service']['active']
             and not observed['orbis-sentinel.socket']['active']):
         raise ActivationError('The service and its required socket observations disagree')
+    observer = _observer_profile(systemd, installed, collector_drop_ins)
+    previous = systemd.__dict__.get('_orbis_observer_profile', _OBSERVER_UNSET)
+    if previous is not _OBSERVER_UNSET and previous != observer:
+        raise RecoveryRequired('The managed observer identity changed during activation')
+    systemd._orbis_observer_profile = observer
+    if observer is not None:
+        observed['observerProfile'] = observer
     return observed
 
 
@@ -488,6 +560,7 @@ def activate_release(artifact, bundle, workspace, *, sha256, version, source_com
             systemd.run('start', 'orbis-sentinel.socket')
             systemd.run('restart', 'orbis-sentinel.service')
             _ready(systemd, version)
+            _profile(systemd, True)
             if _selector(root) != selected or _inventory(candidate, version) != inventory:
                 raise RecoveryRequired('Sentinel activation identity changed during startup')
             for name, body in candidate_units.items():
@@ -527,6 +600,7 @@ def activate_release(artifact, bundle, workspace, *, sha256, version, source_com
                             systemd.run('start', name)
                     if previous_units['orbis-sentinel.service']['active']:
                         _ready(systemd, installed['version'])
+                _profile(systemd, installed is not None)
                 written = _read(state, 'installed.json', 0o600)
                 if written not in (installed_bytes, receipt_bytes):
                     raise RecoveryRequired('Sentinel installation receipt changed during rollback')

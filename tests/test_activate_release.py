@@ -52,9 +52,13 @@ class Supervisor(activate.Systemd):
         self.fail_restart = False
         self.fail_quiescence = False
         self.drop_ins = ''
+        self.unit_drop_ins = {}
+        self.extra_profiles = {}
         self.socket_state = 'listening'
 
     def inspect(self, name):
+        if name in self.extra_profiles:
+            return dict(self.extra_profiles[name])
         exists = (activate.UNITS / name).exists()
         service = name.endswith('.service')
         active = self.active[name]
@@ -67,7 +71,7 @@ class Supervisor(activate.Systemd):
             NeedDaemonReload='no', KillMode='control-group' if service else '',
             MainPID='123' if active and service else '0', ControlPID='0',
             ControlGroup='/system.slice/orbis-sentinel.service' if active and service else '',
-            InvocationID='a' * 32 if active else '', DropInPaths=self.drop_ins)
+            InvocationID='a' * 32 if active else '', DropInPaths=self.unit_drop_ins.get(name, self.drop_ins))
         if self.fail_quiescence and not active and service and any(event[0] == 'stop' for event in self.events):
             value['ControlGroup'] = '/system.slice/orbis-sentinel.service'
         if not service:
@@ -105,7 +109,7 @@ class ActivationTests(unittest.TestCase):
         self.tool = self.root / 'unused-synthetic-verifier'
         self.systemd = Supervisor()
         self.fail_health_version = None
-        for target, value in [('ROOT', self.install), ('STATE', self.state), ('UNITS', self.units)]:
+        for target, value in [('ROOT', self.install), ('STATE', self.state), ('UNITS', self.units), ('SYSUSERS', self.root / 'sysusers')]:
             patch = mock.patch.object(activate, target, value)
             patch.start()
             self.addCleanup(patch.stop)
@@ -134,6 +138,7 @@ class ActivationTests(unittest.TestCase):
             raise activate.ActivationError('Synthetic wrong health identity')
 
     def run_activation(self, package=None):
+        self.systemd.__dict__.pop('_orbis_observer_profile', None)
         self.sequence += 1
         package = package or self.package
         return activate.activate_release(Path(package['artifact']), self.bundle,
@@ -142,6 +147,177 @@ class ActivationTests(unittest.TestCase):
 
     def journal(self):
         return json.loads((self.state / 'activation.json').read_bytes())
+
+    def managed_observer(self):
+        paths = {
+            'collector': (self.units / 'orbis-sentinel.service.d/observer.conf', PACKAGING / 'systemd/orbis-sentinel.service.d/observer.conf'),
+            'host': (self.units / 'orbis-host.service.d/sentinel-observer.conf', PACKAGING / 'systemd/orbis-host.service.d/sentinel-observer.conf'),
+            'socket': (self.units / 'orbis-host-observer.socket', PACKAGING / 'systemd/orbis-host-observer.socket'),
+            'sysusers': (activate.SYSUSERS / 'orbis-sentinel-observer.conf', PACKAGING / 'sysusers.d/orbis-sentinel-observer.conf'),
+        }
+        for target, source in paths.values():
+            target.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+            target.write_bytes(source.read_bytes())
+            target.chmod(0o644)
+        self.observer_paths = {role: pair[0] for role, pair in paths.items()}
+        self.observer_group = SimpleNamespace(gr_gid=1234)
+        patch = mock.patch.object(activate.grp, 'getgrnam', return_value=self.observer_group)
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.systemd.unit_drop_ins['orbis-sentinel.service'] = str(paths['collector'][0])
+        self.systemd.extra_profiles = {
+            'orbis-host.service': {'LoadState': 'loaded', 'FragmentPath': str(self.units / 'orbis-host.service'),
+                'DropInPaths': str(paths['host'][0]), 'NeedDaemonReload': 'no', 'KillMode': 'control-group'},
+            'orbis-host-observer.socket': {'LoadState': 'loaded', 'FragmentPath': str(paths['socket'][0]),
+                'DropInPaths': '', 'NeedDaemonReload': 'no'},
+        }
+        receipt = {'schema': 'orbis-sentinel.observer-profile.v1', 'profile': 'orbis-observer-v1',
+                   'groupId': 1234, 'files': dict(activate.OBSERVER_HASHES)}
+        (self.state / 'observer-profile.json').write_bytes(activate._encoded(receipt))
+        (self.state / 'observer-profile.json').chmod(0o600)
+        return receipt
+
+    def test_default_collector_accepts_an_empty_dropin_directory_without_enabling_an_observer(self):
+        directory = self.units / 'orbis-sentinel.service.d'
+        directory.mkdir(mode=0o755)
+        result = self.run_activation()
+        self.assertTrue(result['activated'])
+        self.assertNotIn('observerProfile', self.journal()['previousUnits'])
+        self.assertEqual(list(directory.iterdir()), [])
+        self.assertFalse((self.state / 'observer-profile.json').exists())
+
+    def test_orphan_observer_receipt_is_not_silently_dropped(self):
+        self.run_activation()
+        self.managed_observer()
+        self.observer_paths['collector'].unlink()
+        self.observer_paths['collector'].parent.rmdir()
+        self.systemd.unit_drop_ins.clear()
+        self.systemd.events.clear()
+        with self.assertRaisesRegex(activate.ActivationError, 'profile requires review'):
+            self.run_activation(self.build('0.1.0-dev.11'))
+        self.assertTrue((self.state / 'observer-profile.json').exists())
+        self.assertEqual(self.systemd.events, [])
+
+    def test_invalid_group_identity_cannot_broaden_the_managed_collector_profile(self):
+        self.run_activation()
+        self.managed_observer()
+        newer = self.build('0.1.0-dev.11')
+        self.systemd.events.clear()
+        for group in (0, -1, 2**31, True, '1234'):
+            with self.subTest(group=group):
+                self.observer_group.gr_gid = group
+                with self.assertRaisesRegex(activate.ActivationError, 'observer group'):
+                    self.run_activation(newer)
+                self.assertEqual(self.systemd.events, [])
+
+    def test_extra_unloaded_dropin_is_preserved_for_review(self):
+        self.run_activation()
+        self.managed_observer()
+        extra = self.observer_paths['collector'].parent / 'extra.conf'
+        extra.write_text('[Service]\nProtectSystem=false\n')
+        self.systemd.events.clear()
+        with self.assertRaisesRegex(activate.ActivationError, 'unreviewed observer drop-in'):
+            self.run_activation(self.build('0.1.0-dev.11'))
+        self.assertEqual(extra.read_text(), '[Service]\nProtectSystem=false\n')
+        self.assertEqual(self.systemd.events, [])
+
+    def test_modified_or_public_observer_receipt_is_refused_before_supervisor_changes(self):
+        self.run_activation()
+        self.managed_observer()
+        receipt = self.state / 'observer-profile.json'
+        original = receipt.read_bytes()
+        newer = self.build('0.1.0-dev.11')
+        self.systemd.events.clear()
+        receipt.write_bytes(original.replace(b'1234', b'1235'))
+        with self.assertRaisesRegex(activate.ActivationError, 'receipt differs'):
+            self.run_activation(newer)
+        receipt.write_bytes(original)
+        receipt.chmod(0o644)
+        with self.assertRaisesRegex(activate.ActivationError, 'untrusted identity'):
+            self.run_activation(newer)
+        self.assertEqual(self.systemd.events, [])
+
+    def test_a_symlinked_managed_profile_is_refused_without_following_it(self):
+        self.run_activation()
+        self.managed_observer()
+        collector = self.observer_paths['collector']
+        retained = self.root / 'retained-observer.conf'
+        collector.rename(retained)
+        collector.symlink_to(retained)
+        before = retained.read_bytes()
+        self.systemd.events.clear()
+        with self.assertRaises(OSError):
+            self.run_activation(self.build('0.1.0-dev.11'))
+        self.assertEqual(retained.read_bytes(), before)
+        self.assertTrue(collector.is_symlink())
+        self.assertEqual(self.systemd.events, [])
+
+    def test_recorded_managed_observer_survives_a_collector_update(self):
+        self.run_activation()
+        receipt = self.managed_observer()
+        before = {role: file.read_bytes() for role, file in self.observer_paths.items()}
+        result = self.run_activation(self.build('0.1.0-dev.11'))
+        self.assertTrue(result['activated'])
+        self.assertEqual(self.journal()['previousUnits']['observerProfile'], receipt)
+        self.assertEqual(before, {role: file.read_bytes() for role, file in self.observer_paths.items()})
+        self.assertEqual((self.state / 'observer-profile.json').read_bytes(), activate._encoded(receipt))
+
+    def test_known_observer_bytes_without_a_managed_receipt_are_not_adopted(self):
+        self.run_activation()
+        self.managed_observer()
+        (self.state / 'observer-profile.json').unlink()
+        previous = (self.install / 'current').readlink()
+        self.systemd.events.clear()
+        with self.assertRaisesRegex(activate.ActivationError, 'adoption requires'):
+            self.run_activation(self.build('0.1.0-dev.11'))
+        self.assertEqual((self.install / 'current').readlink(), previous)
+        self.assertEqual(self.systemd.events, [])
+
+    def test_observer_files_or_receipt_drift_are_preserved_without_supervisor_changes(self):
+        self.run_activation()
+        self.managed_observer()
+        self.observer_paths['collector'].write_bytes(b'[Service]\nGroup=unreviewed\n')
+        before = self.observer_paths['collector'].read_bytes()
+        self.systemd.events.clear()
+        with self.assertRaisesRegex(activate.ActivationError, 'observer files changed'):
+            self.run_activation(self.build('0.1.0-dev.11'))
+        self.assertEqual(self.observer_paths['collector'].read_bytes(), before)
+        self.assertEqual(self.systemd.events, [])
+
+    def test_loaded_host_observer_drift_is_refused_before_activation(self):
+        self.run_activation()
+        self.managed_observer()
+        self.systemd.extra_profiles['orbis-host.service']['DropInPaths'] += ' /foreign.conf'
+        self.systemd.events.clear()
+        with self.assertRaisesRegex(activate.ActivationError, 'loaded Host observer'):
+            self.run_activation(self.build('0.1.0-dev.11'))
+        self.assertEqual(self.systemd.events, [])
+
+    def test_wrong_candidate_health_restores_the_old_collector_and_retains_the_observer(self):
+        self.run_activation()
+        receipt = self.managed_observer()
+        before = (self.state / 'installed.json').read_bytes()
+        newer = self.build('0.1.0-dev.11')
+        self.fail_health_version = newer['version']
+        with self.assertRaisesRegex(activate.ActivationError, 'previous configuration was restored'):
+            self.run_activation(newer)
+        self.assertEqual(self.journal()['phase'], 'rolled-back')
+        self.assertEqual((self.state / 'installed.json').read_bytes(), before)
+        self.assertEqual((self.state / 'observer-profile.json').read_bytes(), activate._encoded(receipt))
+
+    def test_observer_changes_during_startup_leave_reconciliation_instead_of_claiming_rollback(self):
+        self.run_activation()
+        self.managed_observer()
+        ready = self.ready
+        def changed(systemd, version):
+            ready(systemd, version)
+            self.observer_group.gr_gid = 1235
+        with mock.patch.object(activate, '_ready', side_effect=changed):
+            with self.assertRaises(activate.RecoveryRequired):
+                self.run_activation(self.build('0.1.0-dev.11'))
+        self.assertEqual(self.journal()['phase'], 'recovery-required')
+        self.assertTrue((self.install / 'releases/0.1.0-dev.10').is_dir())
+        self.assertTrue((self.install / 'releases/0.1.0-dev.11').is_dir())
 
     def test_first_install_uses_real_staging_and_writes_a_private_verified_receipt(self):
         self.systemd.socket_state = 'running'
@@ -337,7 +513,7 @@ class SupervisorObservationTests(unittest.TestCase):
     def test_ready_accepts_an_active_running_socket_and_stable_service_identity(self):
         systemd = mock.Mock()
         systemd.inspect.side_effect = self.running
-        with mock.patch.object(activate, '_health') as health:
+        with mock.patch.object(activate, '_health') as health, mock.patch.object(activate, '_observer_profile', return_value=None):
             activate._ready(systemd, '1.2.3', timeout=0)
             health.assert_called_once()
 
@@ -348,7 +524,7 @@ class SupervisorObservationTests(unittest.TestCase):
             value['ControlGroup'] = ''
             return value
         systemd.inspect.side_effect = inspect
-        with mock.patch.object(activate, '_health') as health:
+        with mock.patch.object(activate, '_health') as health, mock.patch.object(activate, '_observer_profile', return_value=None):
             with self.assertRaises(activate.ActivationError):
                 activate._ready(systemd, '1.2.3', timeout=0)
             health.assert_not_called()

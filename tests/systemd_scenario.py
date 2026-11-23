@@ -1,6 +1,7 @@
 """Exercise the real activator inside the disposable Linux systemd rootfs."""
 
 import hashlib
+import grp
 import http.client
 import io
 import json
@@ -80,6 +81,88 @@ def privileges(systemd):
     assert fields['NoNewPrivs'].strip() == '1'
     assert os.stat(activation.SOCKET).st_uid == 0
     assert os.stat(activation.SOCKET).st_mode & 0o777 == 0o600
+
+
+def managed_observer_profile(systemd, current_directory, record):
+    # This explicit fixture enrollment installs only publisher-staged templates.
+    # The Host endpoint is a disposable socket-activation placeholder, not an
+    # installed Core/Host or recovery-authority acceptance test.
+    paths = {
+        'collector': (activation.UNITS / 'orbis-sentinel.service.d/observer.conf', 'packaging/systemd/orbis-sentinel.service.d/observer.conf'),
+        'host': (activation.UNITS / 'orbis-host.service.d/sentinel-observer.conf', 'packaging/systemd/orbis-host.service.d/sentinel-observer.conf'),
+        'socket': (activation.UNITS / 'orbis-host-observer.socket', 'packaging/systemd/orbis-host-observer.socket'),
+        'sysusers': (activation.SYSUSERS / 'orbis-sentinel-observer.conf', 'packaging/sysusers.d/orbis-sentinel-observer.conf'),
+    }
+    for role, (target, source) in paths.items():
+        body = (current_directory / source).read_bytes()
+        assert hashlib.sha256(body).hexdigest() == activation.OBSERVER_HASHES[role]
+        target.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+    # Use the activator's protected writer and exact expected bodies.
+    for target, source in paths.values():
+        parent = activation._Parent(target.parent)
+        try:
+            activation._write(parent, target.name, (current_directory / source).read_bytes(), 0o644)
+        finally:
+            parent.close()
+    subprocess.run(['/usr/bin/systemd-sysusers', str(paths['sysusers'][0])], check=True,
+                   capture_output=True, timeout=10, env={'PATH': os.defpath})
+    group = grp.getgrnam('orbis-observer').gr_gid
+    assert 0 < group < 2**31
+    host = b'[Unit]\nDescription=Disposable qualification observer placeholder\n[Service]\nType=simple\nExecStart=/usr/bin/sleep infinity\nKillMode=control-group\n'
+    parent = activation._Parent(activation.UNITS)
+    try:
+        activation._write(parent, 'orbis-host.service', host, 0o644)
+    finally:
+        parent.close()
+    profile = {'schema': 'orbis-sentinel.observer-profile.v1', 'profile': 'orbis-observer-v1',
+               'groupId': group, 'files': dict(activation.OBSERVER_HASHES)}
+    parent = activation._Parent(activation.STATE)
+    try:
+        activation._write(parent, 'observer-profile.json', activation._encoded(profile), 0o600)
+    finally:
+        parent.close()
+    systemd.run('daemon-reload')
+    systemd.run('start', 'orbis-host-observer.socket')
+    systemd.run('restart', 'orbis-sentinel.service')
+    systemd = activation.Systemd()  # A separately recorded Root profile transition.
+    activation._ready(systemd, record['version'])
+    observed = activation._profile(systemd, True)
+    assert observed['observerProfile'] == profile
+    pid = int(systemd.inspect('orbis-sentinel.service')['MainPID'])
+    fields = dict(line.split(':', 1) for line in Path(f'/proc/{pid}/status').read_text().splitlines() if ':' in line)
+    assert int(fields['Gid'].split()[1]) == group
+    assert b'--observer-socket\0/run/orbis-observer/progress.sock\0' in Path(f'/proc/{pid}/cmdline').read_bytes()
+    privileges(systemd)
+    before = {role: target.read_bytes() for role, (target, _) in paths.items()}
+    result = cli(record, 'verify-managed-observer')
+    assert result['activated'] is True and result['reused'] is True
+    systemd = activation.Systemd()
+    activation._ready(systemd, record['version'])
+    assert before == {role: target.read_bytes() for role, (target, _) in paths.items()}
+    journal = json.loads((activation.STATE / 'activation.json').read_bytes())
+    assert journal['phase'] == 'complete' and journal['previousUnits']['observerProfile'] == profile
+    collector = paths['collector'][0]
+    modified = before['collector'] + b'\n# not the recorded managed template\n'
+    collector.write_bytes(modified)
+    prior = systemd.inspect('orbis-sentinel.service')
+    try:
+        activation.activate_release(**options(record, 'verify-observer-drift'))
+    except activation.ActivationError:
+        pass
+    else:
+        raise AssertionError('A changed observer profile must not be activated')
+    after = systemd.inspect('orbis-sentinel.service')
+    assert all(prior[key] == after[key] for key in ('MainPID', 'InvocationID', 'ControlGroup'))
+    assert collector.read_bytes() == modified
+    parent = activation._Parent(collector.parent)
+    try:
+        activation._write(parent, collector.name, before['collector'], 0o644, modified)
+    finally:
+        parent.close()
+    systemd.run('daemon-reload')
+    activation._ready(systemd, record['version'])
+    privileges(systemd)
+    return systemd
 
 
 def main():
@@ -170,14 +253,18 @@ def main():
     activation._ready(systemd, new['version'])
     privileges(systemd)
     assert snapshot(old_directory) == old_files
+    systemd = managed_observer_profile(systemd, current_directory, new)
     systemd.stop()
     print(json.dumps({'schema': 'orbis-sentinel.systemd-qualification.v1', 'passed': True,
         'cases': ['signed-first-install', 'fault-injected-health-rollback', 'signed-older-to-current-retry',
                   'retained-old-runtime', 'independent-unprivileged-service', 'older-installer-downgrade-refusal',
-                  'older-orbis-installer-cli-refusal', 'supervisor-stop'],
+                  'older-orbis-installer-cli-refusal', 'managed-observer-profile-loaded',
+                  'signed-collector-retry-preserves-managed-observer', 'unreviewed-managed-observer-change-refused',
+                  'supervisor-stop'],
         'oldVersion': old['version'], 'newVersion': new['version'],
         'orbisAdapterSource': '9e8f9f5bce1a7e8a3a7ee1d0070dbcd20228684f',
         'publisherVerification': 'real', 'systemd': 'real', 'healthFaultOnly': 'explicit injection',
+        'observerHost': 'disposable-placeholder', 'installedRecoveryAccepted': 0,
         'retainedOldFiles': len(old_files)}, sort_keys=True))
 
 
