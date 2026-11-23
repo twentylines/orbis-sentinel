@@ -349,7 +349,9 @@ class ListenerInstallTests(unittest.TestCase):
                        'configSha256': digest(self.config.read_bytes()), 'unitSha256': digest(self.unit.read_bytes())}
 
         def check():
-            if self.process != process or not self.started or self.errors:
+            if self.errors:
+                raise ValueError('Fixture recovery worker failed') from self.errors[0]
+            if self.process != process or not self.started:
                 raise ValueError('Fixture recovery invocation changed')
         check()
         yield observation, check
@@ -386,7 +388,8 @@ class ListenerInstallTests(unittest.TestCase):
         self.stop.set()
         self.listener_thread.join(5)
         self.assertFalse(self.listener_thread.is_alive())
-        self.assertEqual(self.errors, [])
+        if self.errors:
+            raise AssertionError('Fixture recovery worker failed') from self.errors[0]
 
     def tls_proof(self, _launcher):
         if self.disable_probe:
