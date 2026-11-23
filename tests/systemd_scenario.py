@@ -309,6 +309,14 @@ def managed_observer_api_roundtrip(record):
         os.close(lease)
         parent.close()
 
+    # The following legacy fixture owns a fresh socket/Host start. Retire only
+    # this scenario's disposable placeholder after all preservation assertions.
+    systemd.run('stop', 'orbis-host.service')
+    stopped = systemd.inspect('orbis-host.service')
+    assert (stopped['ActiveState'], stopped['SubState'], stopped['MainPID'], stopped['ControlPID']) == (
+        'inactive', 'dead', '0', '0')
+    assert not stopped['ControlGroup']
+
 
 def managed_observer_profile(systemd, current_directory, record, name='orbis-observer-v1', *, progress=None):
     # Earlier scenarios intentionally fail and roll back the same service.
