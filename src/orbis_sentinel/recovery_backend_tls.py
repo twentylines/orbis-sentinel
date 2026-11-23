@@ -7,7 +7,7 @@ import select
 import ssl
 import subprocess
 import sys
-import tempfile
+import threading
 import time
 
 from . import host_source_publication as publisher
@@ -255,22 +255,58 @@ def _current(before, after):
         fail()
 
 
+@contextmanager
+def _public_authority(authority):
+    if type(authority) is not bytes or not 0 < len(authority) <= MAX_CERT:
+        fail()
+    if sys.platform == 'linux':
+        with os.fdopen(os.memfd_create('orbis-recovery-public-ca',os.MFD_CLOEXEC),'w+b') as handle:
+            handle.write(authority)
+            handle.flush()
+            handle.seek(0)
+            yield handle.fileno(), '/proc/self/fd'
+        return
+
+    # Never create even a transient name inside an immutable TLS generation.
+    # Feed the public CA independently of the leaf on stdin. The writer runs
+    # concurrently because a certificate may exceed the pipe's capacity.
+    reader, writer = os.pipe()
+    errors = []
+
+    def feed():
+        try:
+            with os.fdopen(writer,'wb',buffering=0) as handle:
+                remaining = memoryview(authority)
+                while remaining:
+                    remaining = remaining[handle.write(remaining):]
+        except OSError as error:
+            errors.append(error)
+
+    worker = threading.Thread(target=feed,name='orbis-public-ca')
+    try:
+        worker.start()
+    except BaseException:
+        os.close(reader)
+        os.close(writer)
+        raise
+    try:
+        yield reader, '/dev/fd'
+    finally:
+        # subprocess.run has reaped the child on success, timeout or failure.
+        # Closing our reader also releases a blocked writer on early refusal.
+        os.close(reader)
+        worker.join()
+    if errors:
+        fail()
+
+
 def _purpose(cert, authority, role, path):
     from .recovery_https_install import CONTROL_ENV, SSL_TOOL
 
-    if sys.platform == 'linux':
-        fixture = os.fdopen(os.memfd_create('orbis-recovery-public-ca',os.MFD_CLOEXEC),'w+b')
-        descriptors = '/proc/self/fd'
-    else:
-        fixture = tempfile.TemporaryFile(dir=path)
-        descriptors = '/dev/fd'
-    with fixture as handle:
-        handle.write(authority)
-        handle.flush()
-        handle.seek(0)
+    with _public_authority(authority) as (descriptor, descriptors):
         output = subprocess.run([SSL_TOOL,'verify','-x509_strict','-check_ss_sig','-purpose',role,'-trusted',
-                                 f'{descriptors}/{handle.fileno()}'],input=cert,capture_output=True,
-                                timeout=12,check=False,env=CONTROL_ENV,pass_fds=(handle.fileno(),))
+                                 f'{descriptors}/{descriptor}'],input=cert,capture_output=True,
+                                timeout=12,check=False,env=CONTROL_ENV,pass_fds=(descriptor,))
     if output.returncode or len(output.stdout) > 16384 or len(output.stderr) > 8192 or not output.stdout.rstrip().endswith(b': OK'):
         fail()
 

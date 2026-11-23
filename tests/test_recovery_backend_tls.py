@@ -26,6 +26,32 @@ IMAGE = 'sha256:' + '7' * 64
 
 
 class KeyEncodingTests(unittest.TestCase):
+    def test_portable_authority_pipe_transfers_the_maximum_body(self):
+        authority = b'x' * backend.MAX_CERT
+        received = []
+
+        def verify(command, **kwargs):
+            descriptor = kwargs['pass_fds'][0]
+            self.assertEqual(command[-1],f'/dev/fd/{descriptor}')
+            with open(command[-1],'rb') as stream:
+                received.append(stream.read())
+            return backend.subprocess.CompletedProcess(command,0,b'leaf: OK\n',b'')
+
+        with (mock.patch.object(backend.sys,'platform','darwin'),
+              mock.patch.object(backend.subprocess,'run',side_effect=verify)):
+            backend._purpose(b'leaf',authority,'sslserver',None)
+        self.assertEqual(received,[authority])
+        self.assertFalse(any(thread.name == 'orbis-public-ca' for thread in threading.enumerate()))
+
+    def test_portable_authority_writer_retires_after_timeout_or_spawn_failure(self):
+        for error in [backend.subprocess.TimeoutExpired('openssl',12),OSError('fixture spawn refusal')]:
+            with (self.subTest(error=type(error).__name__),
+                  mock.patch.object(backend.sys,'platform','darwin'),
+                  mock.patch.object(backend.subprocess,'run',side_effect=error),
+                  self.assertRaises(type(error))):
+                backend._purpose(b'leaf',b'x' * backend.MAX_CERT,'sslserver',None)
+            self.assertFalse(any(thread.name == 'orbis-public-ca' for thread in threading.enumerate()))
+
     def test_generated_key_round_trips_without_replacing_its_identity(self):
         from orbis_sentinel.recovery_https_install import _ssl
 
@@ -138,6 +164,27 @@ class Pairs(unittest.TestCase):
         self.assertFalse((self.private/PAIR/'server-key.pem').exists())
         with self.assertRaises(ValueError):
             self.prepare(lambda: (_ for _ in ()).throw(ValueError('guard changed')))
+
+    def test_portable_purpose_verification_never_creates_a_generation_file(self):
+        self.prepare()
+        folder = self.receiver/PAIR
+        before = {path.name:path.read_bytes() for path in folder.iterdir()}
+        run = backend.subprocess.run
+
+        def verify(*args, **kwargs):
+            self.assertEqual(set(os.listdir(folder)),backend.LISTENER_FILES)
+            return run(*args, **kwargs)
+
+        # A named temporary file has a create/unlink window, even when the
+        # resulting descriptor is anonymous. A running listener checks this
+        # exact directory concurrently and must never observe that window.
+        with (mock.patch.object(backend.sys,'platform','darwin'),
+              mock.patch.object(tempfile,'TemporaryFile',side_effect=AssertionError('generation mutation')),
+              mock.patch.object(backend.subprocess,'run',side_effect=verify)):
+            backend._purpose(before['server.pem'],before['ca.pem'],'sslserver',folder)
+            with self.assertRaises(ValueError):
+                backend._purpose(before['server.pem'],before['ca.pem'],'sslclient',folder)
+        self.assertEqual({path.name:path.read_bytes() for path in folder.iterdir()},before)
 
     def test_exact_interrupted_manifest_publication_replays_same_keys(self):
         from orbis_sentinel import recovery_https_install

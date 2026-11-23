@@ -84,6 +84,10 @@ def privileges(systemd):
 
 
 def managed_observer_profile(systemd, current_directory, record):
+    # Earlier scenarios intentionally fail and roll back the same service.
+    # Give this independent fixture its own restart budget; production start
+    # limits and the activator's health/rollback behavior remain unchanged.
+    systemd.run('reset-failed', 'orbis-sentinel.service')
     # This explicit fixture enrollment installs only publisher-staged templates.
     # The Host endpoint is a disposable socket-activation placeholder, not an
     # installed Core/Host or recovery-authority acceptance test.
