@@ -229,6 +229,60 @@ class ObserverChangeTests(unittest.TestCase):
         self.assertFalse(self.observer_active)
         self.assert_host_preserved()
 
+    def advance_retained_activation(self, version):
+        binding = {'operationId': str(uuid.uuid4()), 'planSha256': '4' * 64, 'targetDigest': 'sha256:' + '5' * 64}
+        self.retention = self.run_activation(self.build(version), retain=binding,
+                                             activation_lock_fd=self.lease)['retainedRollback']
+        self.systemd.events.clear()
+
+    def test_successive_activations_preserve_deferred_socket_until_host_maintenance(self):
+        self.prepare()
+        initial = self.enroll()
+        self.advance_retained_activation('0.1.0-dev.12')
+        repeated = self.enroll()
+        self.assertEqual(repeated['profile'], initial['profile'])
+        self.assertEqual(self.restore(repeated['ticket'])['profile'], initial['profile'])
+        self.assertEqual(self.systemd.events, [])
+        self.assertFalse(self.observer_active)
+        self.assert_host_preserved()
+
+        self.advance_retained_activation('0.1.0-dev.13')
+        repeated = self.enroll()
+        self.host_pid += 100
+        with self.assertRaises(activate.RecoveryRequired):
+            activate.activate_observer_profile(repeated['ticket'], activation_lock_fd=self.lease)
+        self.observer_active = True
+        self.assertEqual(activate.activate_observer_profile(repeated['ticket'], activation_lock_fd=self.lease), repeated)
+        self.assertEqual(self.systemd.events, [])
+
+    def test_inactive_socket_requires_intact_custody_and_the_original_host(self):
+        self.prepare()
+        initial = self.enroll()
+        self.advance_retained_activation('0.1.0-dev.12')
+        record = self.state / 'observer-change.json'
+        body = record.read_bytes()
+        admission = self.state / ('observer-admission-' + initial['ticket']['id'] + '.json')
+        original_admission = admission.read_bytes()
+
+        record.unlink()
+        with self.assertRaises(activate.RecoveryRequired):
+            self.enroll()
+        self.assertFalse(record.exists())
+        record.write_bytes(body)
+        record.chmod(0o600)
+
+        admission.write_bytes(original_admission + b'\n')
+        with self.assertRaises(activate.RecoveryRequired):
+            self.enroll()
+        admission.write_bytes(original_admission)
+
+        self.host_pid += 100
+        with self.assertRaises(activate.RecoveryRequired):
+            self.enroll()
+        self.assertEqual(record.read_bytes(), body)
+        self.assertEqual(len(list(self.state.glob('observer-admission-*'))), 1)
+        self.assertEqual(self.systemd.events, [])
+
     def test_return_after_helper_start_preserves_the_new_host_and_stops_its_removed_socket(self):
         self.prepare()
         result = self.enroll()

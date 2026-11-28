@@ -295,6 +295,34 @@ def managed_observer_api_roundtrip(record):
         same = activation.Systemd().inspect('orbis-sentinel.service')
         assert all(same[key] == before[key] for key in ('MainPID', 'InvocationID', 'ControlGroup'))
         assert activation._observer_host(activation.Systemd(), None) == replacement_host
+        # A same-byte helper update can finish without creating a new Host
+        # generation. A later activation must respect that exact deferral.
+        systemd.run('reset-failed', 'orbis-sentinel.service')
+        first_binding = {**binding, 'operationId': str(uuid.uuid4())}
+        first = activation.activate_release(**options(record, 'verify-observer-defer-first'),
+            retain=first_binding, activation_lock_fd=lease)
+        prepared = activation.prepare_observer_profile(first['retainedRollback'], activation_lock_fd=lease)
+        with independent_progress(first_binding['operationId']) as progress:
+            enrolled = activation.activate_observer_profile(prepared['ticket'], activation_lock_fd=lease)
+            activation._observer_socket(activation.Systemd(), False)
+            await_progress(progress)
+        second_binding = {**binding, 'operationId': str(uuid.uuid4())}
+        second = activation.activate_release(**options(record, 'verify-observer-defer-second'),
+            retain=second_binding, activation_lock_fd=lease)
+        collector = activation.Systemd().inspect('orbis-sentinel.service')
+        prepared = activation.prepare_observer_profile(second['retainedRollback'], activation_lock_fd=lease)
+        with independent_progress(second_binding['operationId']) as progress:
+            repeated = activation.activate_observer_profile(prepared['ticket'], activation_lock_fd=lease)
+            assert repeated['enrolled'] and repeated['profile'] == enrolled['profile']
+            activation._observer_socket(activation.Systemd(), False)
+            assert activation._observer_host(activation.Systemd(), repeated['profile']) == replacement_host
+            current = activation.Systemd().inspect('orbis-sentinel.service')
+            assert all(current[key] == collector[key] for key in ('MainPID', 'InvocationID', 'ControlGroup'))
+            await_progress(progress)
+            returned = activation.restore_observer_profile(prepared['ticket'], activation_lock_fd=lease)
+            assert returned['restored'] and returned['profile'] == repeated['profile']
+            activation._observer_socket(activation.Systemd(), False)
+            assert activation._observer_host(activation.Systemd(), returned['profile']) == replacement_host
         other = os.open(activation.STATE / 'activation.lock', os.O_RDWR | os.O_NOFOLLOW)
         try:
             try:
@@ -560,6 +588,7 @@ def main():
                   'managed-observer-api-activation-preserves-host', 'managed-observer-api-return-preserves-host',
                   'managed-observer-api-prepared-only-return-without-restart', 'managed-observer-api-preserves-parent-lease',
                   'deferred-observer-socket-starts-with-next-host',
+                  'successive-activation-preserves-deferred-observer-socket',
                   'signed-collector-retry-preserves-managed-observer', 'unreviewed-managed-observer-change-refused',
                   'managed-independent-progress-profile-loaded', 'signed-collector-retry-preserves-independent-progress',
                   'independent-progress-with-stalled-host', 'unreviewed-independent-profile-change-refused',
