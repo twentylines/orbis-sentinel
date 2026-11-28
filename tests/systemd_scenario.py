@@ -295,6 +295,25 @@ def managed_observer_api_roundtrip(record):
         same = activation.Systemd().inspect('orbis-sentinel.service')
         assert all(same[key] == before[key] for key in ('MainPID', 'InvocationID', 'ControlGroup'))
         assert activation._observer_host(activation.Systemd(), None) == replacement_host
+        # An admitted observer can still have a deferred socket when the
+        # operation returns before another Host generation claims it.
+        systemd.run('reset-failed', 'orbis-sentinel.service')
+        deferred_binding = {**binding, 'operationId': str(uuid.uuid4())}
+        deferred = activation.activate_release(**options(record, 'verify-observer-deferred-return'),
+            retain=deferred_binding, activation_lock_fd=lease)
+        prepared = activation.prepare_observer_profile(deferred['retainedRollback'], activation_lock_fd=lease)
+        with independent_progress(deferred_binding['operationId']) as progress:
+            enrolled = activation.activate_observer_profile(prepared['ticket'], activation_lock_fd=lease)
+            activation._observer_socket(activation.Systemd(), False)
+            assert activation._observer_host(activation.Systemd(), enrolled['profile']) == replacement_host
+            await_progress(progress)
+            returned = activation.restore_observer_profile(prepared['ticket'], activation_lock_fd=lease)
+            assert returned['restored'] and returned['profile'] is None
+            final_systemd = activation.Systemd()
+            activation._observer_socket(final_systemd, False)
+            assert final_systemd.inspect('orbis-host-observer.socket')['LoadState'] == 'not-found'
+            assert activation._observer_host(final_systemd, None) == replacement_host
+            activation._ready(final_systemd, record['version'])
         # A same-byte helper update can finish without creating a new Host
         # generation. A later activation must respect that exact deferral.
         systemd.run('reset-failed', 'orbis-sentinel.service')

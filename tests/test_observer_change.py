@@ -46,6 +46,8 @@ class ScopedSupervisor:
             # while its service is already active. A fake supervisor must not
             # conceal that constraint by silently accepting the request.
             raise activate.ActivationError('Socket service is already active')
+        if action == 'stop' and names == ('orbis-host-observer.socket',) and not f.observer_active and not f.loaded_socket:
+            raise activate.ActivationError('The unloaded socket cannot be stopped')
         if action == 'show':
             f.systemd.events.append((action, *names))
             return 'Requires=' + ('orbis-host-observer.socket' if f.foreign_dependency else '') + '\nBindsTo=\nPartOf=\n'
@@ -167,6 +169,7 @@ class ObserverChangeTests(unittest.TestCase):
         restored = self.restore(result['ticket'])
         self.assertTrue(restored['restored']);self.assertIsNone(restored['profile'])
         self.assertEqual(self.change_record()['phase'], 'returned')
+        self.assertNotIn(('stop', 'orbis-host-observer.socket'), self.systemd.events)
         self.assertTrue(all(not path.exists() for path in activate._observer_paths().values()))
         self.assertFalse((self.state / 'observer-profile.json').exists())
         self.assertEqual(self.group, 1234)  # Never delete a possibly used system group.
@@ -295,6 +298,7 @@ class ObserverChangeTests(unittest.TestCase):
         self.assertTrue(self.restore(result['ticket'])['restored'])
         self.assertEqual(self.host_pid, current_host)
         self.assertFalse(self.observer_active)
+        self.assertIn(('stop', 'orbis-host-observer.socket'), self.systemd.events)
 
     def test_cancelled_preparation_can_return_without_restarting_either_service(self):
         self.prepare()

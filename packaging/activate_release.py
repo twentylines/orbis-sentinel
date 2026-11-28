@@ -1275,7 +1275,12 @@ def restore_observer_profile(ticket, *, activation_lock_fd):
                             or {item[0] for item in properties} != {'Requires', 'BindsTo', 'PartOf'}
                             or any('orbis-host-observer.socket' in item[1].split() for item in properties)):
                         raise RecoveryRequired('Host still depends on the observer socket')
-                    systemd.run('stop', 'orbis-host-observer.socket')
+                    # A deferred socket can disappear during daemon-reload
+                    # once its unit file is removed. Confirm inactivity
+                    # instead of trying to stop an unloaded unit.
+                    socket = systemd.inspect('orbis-host-observer.socket')
+                    if socket.get('ActiveState') != 'inactive':
+                        systemd.run('stop', 'orbis-host-observer.socket')
                     _observer_socket(systemd, False)
                 if not pending:
                     systemd.run('restart', 'orbis-sentinel.service')
